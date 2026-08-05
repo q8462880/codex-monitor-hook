@@ -1,9 +1,9 @@
 # Install Codex Monitor Hook
 
-For Codex, use this prompt after replacing `<OWNER>` with the GitHub owner:
+For Codex, use this prompt:
 
 ```text
-Fetch and follow instructions from https://raw.githubusercontent.com/<OWNER>/codex-monitor-hook/refs/heads/main/.codex/INSTALL.md
+Fetch and follow instructions from https://raw.githubusercontent.com/q8462880/codex-monitor-hook/refs/heads/master/.codex/INSTALL.md
 ```
 
 The fetched installer document tells Codex how to clone or update this repository, install the

@@ -28,7 +28,7 @@ Codex `config.toml`, so always preserve the automatic backup created by `scripts
    Windows PowerShell:
 
    ```powershell
-   $Repo = "https://github.com/<OWNER>/codex-monitor-hook.git"
+   $Repo = "https://github.com/q8462880/codex-monitor-hook.git"
    $Target = Join-Path $HOME ".codex\codex-monitor-hook"
    if (Test-Path -LiteralPath $Target) {
        git -C $Target pull --ff-only
@@ -40,7 +40,7 @@ Codex `config.toml`, so always preserve the automatic backup created by `scripts
    macOS/Linux shell:
 
    ```bash
-   REPO="https://github.com/<OWNER>/codex-monitor-hook.git"
+   REPO="https://github.com/q8462880/codex-monitor-hook.git"
    TARGET="$HOME/.codex/codex-monitor-hook"
    if [ -d "$TARGET/.git" ]; then
      git -C "$TARGET" pull --ff-only
