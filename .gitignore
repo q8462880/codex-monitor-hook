@@ -1,0 +1,24 @@
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# 本地虚拟环境
+.venv/
+venv/
+env/
+
+# 本地运行日志与临时文件
+*.log
+*.tmp
+*.bak
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
