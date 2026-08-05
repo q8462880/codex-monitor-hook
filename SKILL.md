@@ -1,6 +1,6 @@
 ---
 name: codex-monitor-hook
-description: Deploy and maintain a local Codex hook relay plus Python HID daemon for showing Codex session state and quota text on a custom HID screen. Use when installing, updating, or troubleshooting the codex-monitor-hook project, ~/.codex_screen files, localhost:12688 relay, hidapi dependency, or Codex hook configuration.
+description: Deploy and maintain a local Codex hook relay plus packaged HID daemon for showing Codex session state and quota text on a custom HID screen. Use when installing, updating, or troubleshooting the codex-monitor-hook project, ~/.codex_screen files, localhost:12688 relay, packaged executables, or Codex hook configuration.
 ---
 
 # Codex Monitor Hook
@@ -12,14 +12,15 @@ description: Deploy and maintain a local Codex hook relay plus Python HID daemon
 - `scripts/codex_quota_client.py`: Optional Codex app-server quota reader. It keeps one hidden stdio app-server connection for the daemon lifetime, reuses it for refreshes, and reconnects after a timeout or process exit; failures fall back silently.
 - `scripts/codex_screen_log.py`: Shared file logger. It writes short lifecycle logs to `~/.codex_screen/codex_screen.log` without recording full prompts.
 - `scripts/update_codex_config.py`: Installer helper that backs up `config.toml`, installs the hook marker block, and validates TOML syntax.
-- `scripts/install.ps1`: Windows-friendly installer that copies runtime Python files, backs up Codex `config.toml`, and installs hook config.
+- `scripts/install.ps1`: Windows-friendly installer that copies packaged exe files, backs up Codex `config.toml`, and installs hook config.
+- `bin/windows-x64/`: Windows user-facing executables copied by the installer.
 - `references/codex_config_hooks.toml`: Hook snippet that can be appended to Codex `config.toml` after installation.
 
 ## Required Architecture
 
 Keep this architecture unchanged unless the user explicitly changes it:
 
-`Codex Hook -> codex_hook_relay.py -> 127.0.0.1:12688 TCP -> codex_screen_daemon.py -> HID device`
+`Codex Hook -> codex_hook_relay.exe -> 127.0.0.1:12688 TCP -> codex_screen_daemon.exe -> HID device`
 
 Rules:
 
@@ -34,7 +35,8 @@ Rules:
   `UserPromptSubmit` starts a turn, tool/permission/compaction/subagent hooks update the
   turn's detailed state, matching `Stop` ends only that turn, and `SessionEnd` ends the
   whole session. Stale events from another session or an already stopped turn are ignored.
-- Runtime dependency is standard Python plus `hidapi` only.
+- Ordinary Windows users do not install Python, `pip`, or `hidapi`; those are bundled into the packaged executables.
+- Source development still uses standard Python plus `hidapi` only.
 - Real quota lookup is optional. It requires a Codex app-server auth mode that can read `account/rateLimits/read`; API-key-only auth may return `chatgpt authentication required`.
 
 ## Deployment Workflow
@@ -42,16 +44,10 @@ Rules:
 For a Superpowers-style remote install prompt, publish this repository on GitHub and tell Codex:
 
 ```text
-Fetch and follow instructions from https://raw.githubusercontent.com/<OWNER>/codex-monitor-hook/refs/heads/main/.codex/INSTALL.md
+Fetch and follow instructions from https://raw.githubusercontent.com/q8462880/codex-monitor-hook/refs/heads/master/.codex/INSTALL.md
 ```
 
-1. Install dependency:
-
-   ```powershell
-   python -m pip install hidapi
-   ```
-
-2. Copy runtime files and install hooks:
+1. Copy packaged runtime files and install hooks:
 
    ```powershell
    .\scripts\install.ps1
@@ -59,11 +55,10 @@ Fetch and follow instructions from https://raw.githubusercontent.com/<OWNER>/cod
 
    The installer backs up the previous Codex config to `config.toml.codex-monitor-hook.<timestamp>.bak` before writing hook settings.
 
-3. Verify the install:
+2. Verify the install:
 
    ```powershell
-   python -m py_compile $HOME\.codex_screen\codex_hook_relay.py $HOME\.codex_screen\codex_screen_daemon.py $HOME\.codex_screen\codex_quota_client.py
-   python $HOME\.codex_screen\codex_screen_daemon.py --self-test
+   & $HOME\.codex_screen\codex_screen_daemon.exe --self-test
    ```
 
 ## Quota Display
@@ -82,13 +77,12 @@ stops, it waits for the quota thread to close the app-server child.
 
 ## Installer Options
 
-- `.\scripts\install.ps1 -SkipPipInstall`: skip `python -m pip install hidapi`.
 - `.\scripts\install.ps1 -SkipConfigUpdate`: copy runtime files without changing Codex `config.toml`.
 - `.\scripts\install.ps1 -HookProfile minimal`: install only `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop`, and `SessionEnd`; this reduces Windows PowerShell hook launches when performance matters.
 - `.\scripts\install.ps1 -CodexHome D:\tmp\codex-home`: write config under a custom Codex home, useful for testing.
 
-On Windows the installer writes a hidden-console launcher plus `pythonw.exe` in `commandWindows`. The launcher hides the
-PowerShell console created by Codex before forwarding stdin to the relay.
+On Windows the installer writes a hidden-console launcher plus `codex_hook_relay.exe` in `commandWindows`. The launcher hides the
+PowerShell console created by Codex before forwarding stdin to the relay exe.
 
 ## Runtime Logs and Hook Smoke Test
 
@@ -102,7 +96,7 @@ Use this local smoke test to confirm relay -> daemon works before testing a real
 
 ```powershell
 Remove-Item $HOME\.codex_screen\codex_screen.log -ErrorAction SilentlyContinue
-'{"hook_event_name":"SessionStart","session_id":"manual-test"}' | python $HOME\.codex_screen\codex_hook_relay.py
+'{"hook_event_name":"SessionStart","session_id":"manual-test"}' | & $HOME\.codex_screen\codex_hook_relay.exe
 Get-Content $HOME\.codex_screen\codex_screen.log -Tail 80
 ```
 

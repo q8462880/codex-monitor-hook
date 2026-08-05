@@ -25,6 +25,37 @@ class CodexHookRelayTest(unittest.TestCase):
                 with relay._relay_instance_lock() as second_acquired:
                     self.assertTrue(second_acquired)
 
+    def test_daemon_command_prefers_packaged_exe_on_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            daemon_exe = base_dir / "codex_screen_daemon.exe"
+            daemon_script = base_dir / "codex_screen_daemon.py"
+            daemon_exe.write_text("", encoding="utf-8")
+            daemon_script.write_text("", encoding="utf-8")
+
+            with patch.object(relay.os, "name", "nt"), patch.object(
+                relay, "DAEMON_EXE", daemon_exe
+            ), patch.object(relay, "DAEMON_SCRIPT", daemon_script):
+                self.assertEqual(
+                    [str(daemon_exe), "--daemon"],
+                    relay._daemon_command(),
+                )
+
+    def test_daemon_command_keeps_source_fallback_for_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = Path(directory)
+            daemon_exe = base_dir / "codex_screen_daemon.exe"
+            daemon_script = base_dir / "codex_screen_daemon.py"
+            daemon_script.write_text("", encoding="utf-8")
+
+            with patch.object(relay, "DAEMON_EXE", daemon_exe), patch.object(
+                relay, "DAEMON_SCRIPT", daemon_script
+            ):
+                command = relay._daemon_command()
+
+            self.assertEqual(str(daemon_script), command[1])
+            self.assertEqual("--daemon", command[2])
+
 
 if __name__ == "__main__":
     unittest.main()

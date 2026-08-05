@@ -27,6 +27,7 @@ from codex_screen_log import log_line
 
 # ===== 配置区：只保留本地转发相关参数 =====
 BASE_DIR = Path.home() / ".codex_screen"
+DAEMON_EXE = BASE_DIR / "codex_screen_daemon.exe"
 DAEMON_SCRIPT = BASE_DIR / "codex_screen_daemon.py"
 DAEMON_HOST = "127.0.0.1"
 DAEMON_PORT = 12688
@@ -78,12 +79,14 @@ def _read_hook_event() -> Dict[str, Any]:
 def _spawn_detached_daemon() -> bool:
     """跨平台后台脱离启动 daemon。"""
 
-    if not DAEMON_SCRIPT.exists():
-        log_line("relay", f"daemon script missing: {DAEMON_SCRIPT}")
+    args = _daemon_command()
+    if not args:
+        log_line(
+            "relay",
+            f"daemon executable missing: {DAEMON_EXE}; script missing: {DAEMON_SCRIPT}",
+        )
         return False
 
-    python_bin = sys.executable or "python"
-    args = [python_bin, str(DAEMON_SCRIPT), "--daemon"]
     kwargs: Dict[str, Any] = {
         "cwd": str(BASE_DIR),
         "stdin": subprocess.DEVNULL,
@@ -103,8 +106,24 @@ def _spawn_detached_daemon() -> bool:
         kwargs["start_new_session"] = True
 
     subprocess.Popen(args, **kwargs)
-    log_line("relay", f"spawned daemon: {DAEMON_SCRIPT}")
+    log_line("relay", f"spawned daemon: {args[0]}")
     return True
+
+
+def _daemon_command() -> list[str]:
+    """返回 daemon 启动命令；普通用户安装包优先使用 exe。"""
+
+    # PyInstaller 打包后 relay 自己也是 exe，sys.executable 指向 relay。
+    # 因此不能再用 sys.executable 去运行 daemon.py，必须启动同目录的 daemon exe。
+    if os.name == "nt" and DAEMON_EXE.exists():
+        return [str(DAEMON_EXE), "--daemon"]
+
+    # 这个分支只服务仓库内开发和测试，普通用户安装包不依赖 Python。
+    if DAEMON_SCRIPT.exists():
+        python_bin = sys.executable or "python"
+        return [python_bin, str(DAEMON_SCRIPT), "--daemon"]
+
+    return []
 
 
 def _try_lock(lock_handle: Any) -> bool:

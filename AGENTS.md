@@ -14,7 +14,8 @@
 
 ## 架构边界
 
-- 固定链路：Codex Hook 脚本 -> `127.0.0.1:12688` TCP -> Python daemon -> HID 设备。
+- 固定链路：Codex Hook -> `codex_hook_relay.exe` -> `127.0.0.1:12688` TCP -> `codex_screen_daemon.exe` -> HID 设备。
+- 源码仍使用 Python 开发和测试；普通 Windows 用户安装时只运行预打包 exe，不安装 Python / pip / hidapi。
 - `scripts/codex_hook_relay.py` 只能做本地 Socket 转发和 daemon 拉起，禁止导入或操作 HID / USB。
 - `scripts/codex_screen_daemon.py` 是唯一允许长期独占 HID 设备的进程。
 - daemon 启动时端口已占用必须直接退出，用端口占用实现单实例保护。
@@ -28,7 +29,7 @@
 
 ## 依赖与配置
 
-- Python 代码只使用标准库和 `hidapi`。
+- Python 源码只使用标准库和 `hidapi`；用户安装包必须把运行依赖打进 exe。
 - 所有硬件参数集中放在 daemon 文件顶部配置区，方便以后改 VID / PID / Usage / Report Size。
 - 真实 Codex 额度查询只允许放在 daemon 侧或 daemon 调用的本地模块里，hook relay 仍然禁止做额度查询。
 - 额度查询失败必须降级到 `CODEX_SCREEN_QUOTA_TEXT` 或 hook 事件里的额度文本，不能影响 HID 状态显示。

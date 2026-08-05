@@ -57,7 +57,6 @@ def toml_string(value: str) -> str:
 
 def build_hook_block(
     relay_path: str,
-    windows_python: str = "pythonw",
     hook_profile: str = "full",
 ) -> str:
     """生成 Codex 当前版本能识别的嵌套 hook 配置。"""
@@ -68,11 +67,11 @@ def build_hook_block(
         raise ValueError(f"unknown hook profile: {hook_profile}")
 
     # Codex 在 Windows 上会通过 pwsh -Command 执行这段字符串。
-    # 先调用隐藏窗口启动器，再由启动器调用 pythonw，可以避免外层
+    # 先调用隐藏窗口启动器，再由启动器调用 relay exe，可以避免外层
     # PowerShell 控制台闪现。调用绝对路径时必须使用 &。
     launcher_path = str(Path(relay_path).with_name("codex_hook_windows_launcher.ps1"))
     command_windows = toml_string(
-        f'& "{launcher_path}" -Pythonw "{windows_python}" -Relay "{relay_path}"'
+        f'& "{launcher_path}" -RelayExe "{relay_path}"'
     )
     lines = [START_MARKER]
     for event_name in HOOK_PROFILES[hook_profile]:
@@ -83,7 +82,7 @@ def build_hook_block(
                 "",
                 f"[[hooks.{event_name}.hooks]]",
                 'type = "command"',
-                'command = "python3 ~/.codex_screen/codex_hook_relay.py"',
+                'command = "~/.codex_screen/codex_hook_relay"',
                 f"commandWindows = {command_windows}",
                 "timeout = 5",
             ]
@@ -138,7 +137,6 @@ def _preserved_suffix(old_block: str) -> str:
 def update_config(
     config_path: Path,
     relay_path: str,
-    windows_python: str = "pythonw",
     hook_profile: str = "full",
 ) -> str:
     """更新 config 并返回备份路径。"""
@@ -148,7 +146,7 @@ def update_config(
     old_text = config_path.read_text(encoding="utf-8-sig") if config_path.exists() else ""
     new_text = merge_hook_block(
         old_text,
-        build_hook_block(relay_path, windows_python, hook_profile),
+        build_hook_block(relay_path, hook_profile),
     )
     config_path.write_text(new_text.rstrip() + "\n", encoding="utf-8")
     tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -156,18 +154,15 @@ def update_config(
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) not in (3, 4, 5):
+    if len(argv) not in (3, 4):
         print(
-            "usage: update_codex_config.py <config.toml> <relay.py> [pythonw] [full|minimal]",
+            "usage: update_codex_config.py <config.toml> <relay.exe> [full|minimal]",
             file=sys.stderr,
         )
         return 2
 
-    windows_python = argv[3] if len(argv) == 4 else "pythonw"
-    if len(argv) == 5:
-        windows_python = argv[3]
-    hook_profile = argv[4] if len(argv) == 5 else "full"
-    backup_path = update_config(Path(argv[1]), argv[2], windows_python, hook_profile)
+    hook_profile = argv[3] if len(argv) == 4 else "full"
+    backup_path = update_config(Path(argv[1]), argv[2], hook_profile)
     print("BACKUP_PATH=" + backup_path)
     return 0
 

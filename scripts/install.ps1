@@ -3,119 +3,176 @@
     [string]$CodexHome = "",
     [ValidateSet("full", "minimal")]
     [string]$HookProfile = "full",
-    [switch]$SkipConfigUpdate,
-    [switch]$SkipPipInstall,
-    [switch]$InstallPythonIfMissing
+    [switch]$SkipConfigUpdate
 )
 
 $ErrorActionPreference = "Stop"
 
-function Test-PythonCommand {
-    param([string]$Command)
+$StartMarker = "# BEGIN codex-monitor-hook"
+$EndMarker = "# END codex-monitor-hook"
+$FullHookEvents = @(
+    "SessionStart",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd"
+)
+$MinimalHookEvents = @(
+    "SessionStart",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "Stop",
+    "SessionEnd"
+)
 
-    # 只运行最小 Python 代码，避免误把 Windows Store 的 python 占位命令当成可用解释器。
-    try {
-        & $Command -c "import sys; print(sys.executable)" 2>$null | Out-Null
-        return $LASTEXITCODE -eq 0
-    } catch {
-        return $false
+function Assert-Windows {
+    if ([Environment]::OSVersion.Platform -ne "Win32NT") {
+        throw "This packaged installer currently supports Windows only."
     }
 }
 
-function Install-UserPython {
-    $Winget = Get-Command "winget" -ErrorAction SilentlyContinue
-    if (-not $Winget) {
-        throw "Python was not found and winget is unavailable. Install Python 3.11+ from https://www.python.org/downloads/ and re-run this installer."
+function ConvertTo-TomlString {
+    param([string]$Value)
+
+    if (-not $Value.Contains("'")) {
+        return "'" + $Value + "'"
     }
 
-    # 普通用户机器可能没有 Python；带 -InstallPythonIfMissing 时尝试用 winget 做当前用户安装。
-    # 不把这一步设为默认，是为了避免脚本在未明确授权时安装系统级软件。
-    Write-Host "Python was not found. Installing Python 3.12 for current user with winget..."
-    & winget install --id Python.Python.3.12 --source winget --scope user --silent --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) {
-        throw "winget failed to install Python. Install Python 3.11+ manually and re-run this installer."
-    }
+    $Escaped = $Value.Replace("\", "\\").Replace('"', '\"')
+    return '"' + $Escaped + '"'
 }
 
-function Resolve-PythonCommand {
-    # 优先使用用户明确指定的 PYTHON，其次尝试 Windows 常见的 py/python/python3。
-    if ($env:PYTHON -and (Test-PythonCommand $env:PYTHON)) {
-        return $env:PYTHON
+function Get-HookEvents {
+    if ($HookProfile -eq "minimal") {
+        return $MinimalHookEvents
+    }
+    return $FullHookEvents
+}
+
+function New-HookBlock {
+    param(
+        [string]$RelayExe,
+        [string]$Launcher
+    )
+
+    # Codex Windows hook 会通过 pwsh 执行 commandWindows。
+    # 仍然保留 launcher，是为了第一时间隐藏 Codex 创建的外层控制台窗口。
+    $CommandWindows = ConvertTo-TomlString "& `"$Launcher`" -RelayExe `"$RelayExe`""
+    $Lines = New-Object System.Collections.Generic.List[string]
+    $Lines.Add($StartMarker)
+
+    foreach ($EventName in (Get-HookEvents)) {
+        $Lines.Add("")
+        $Lines.Add("[[hooks.$EventName]]")
+        $Lines.Add("")
+        $Lines.Add("[[hooks.$EventName.hooks]]")
+        $Lines.Add('type = "command"')
+        $Lines.Add('command = "~/.codex_screen/codex_hook_relay"')
+        $Lines.Add("commandWindows = $CommandWindows")
+        $Lines.Add("timeout = 5")
     }
 
-    foreach ($Candidate in @("py", "python", "python3")) {
-        $Found = Get-Command $Candidate -ErrorAction SilentlyContinue
-        if ($Found -and (Test-PythonCommand $Candidate)) {
-            return $Candidate
+    $Lines.Add($EndMarker)
+    return ($Lines -join "`n")
+}
+
+function Backup-CodexConfig {
+    param([string]$ConfigPath)
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        return ""
+    }
+
+    $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $BackupPath = "$ConfigPath.codex-monitor-hook.$Stamp.bak"
+    Copy-Item -LiteralPath $ConfigPath -Destination $BackupPath -Force
+    return $BackupPath
+}
+
+function Get-PreservedSuffix {
+    param([string]$OldBlock)
+
+    # 老版本曾把 Codex 维护的 hooks.state 夹在标记块里。
+    # 替换 hook 时保留这些表，避免用户重新确认 hook trust。
+    $Positions = @()
+    foreach ($Marker in @("`n[hooks.state]", "`n[plugins.", "`n[features]")) {
+        $Position = $OldBlock.IndexOf($Marker)
+        if ($Position -ge 0) {
+            $Positions += $Position
         }
     }
+    if ($Positions.Count -eq 0) {
+        return ""
+    }
 
-    if ($InstallPythonIfMissing) {
-        Install-UserPython
-        foreach ($Candidate in @("py", "python", "python3")) {
-            $Found = Get-Command $Candidate -ErrorAction SilentlyContinue
-            if ($Found -and (Test-PythonCommand $Candidate)) {
-                return $Candidate
-            }
+    $Start = ($Positions | Measure-Object -Minimum).Minimum
+    $Suffix = $OldBlock.Substring($Start).Trim()
+    return ($Suffix -replace [regex]::Escape($EndMarker) + "\s*$", "").TrimEnd()
+}
+
+function Merge-HookBlock {
+    param(
+        [string]$OldText,
+        [string]$Block
+    )
+
+    $Pattern = "(?s)" + [regex]::Escape($StartMarker) + ".*?" + [regex]::Escape($EndMarker)
+    $Match = [regex]::Match($OldText, $Pattern)
+    if ($Match.Success) {
+        $Replacement = $Block
+        $Suffix = Get-PreservedSuffix $Match.Value
+        if ($Suffix) {
+            $Replacement = $Replacement + "`n`n" + $Suffix
         }
+        return $OldText.Substring(0, $Match.Index) + $Replacement + $OldText.Substring($Match.Index + $Match.Length)
     }
 
-    throw "Python 3.11+ was not found. Re-run with -InstallPythonIfMissing, or install Python from https://www.python.org/downloads/."
+    $Prefix = $OldText.TrimEnd()
+    if ($Prefix) {
+        return $Prefix + "`n`n" + $Block
+    }
+    return $Block
 }
 
-function Ensure-Pip {
-    param([string]$Python)
+function Update-CodexConfig {
+    param(
+        [string]$ConfigPath,
+        [string]$RelayExe,
+        [string]$Launcher
+    )
 
-    # hidapi 通过 pip 安装；如果 Python 没带 pip，先用标准库 ensurepip 自举。
-    & $Python -m pip --version 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        return
+    $ConfigDir = Split-Path -Parent $ConfigPath
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    $BackupPath = Backup-CodexConfig $ConfigPath
+    $OldText = ""
+    if (Test-Path -LiteralPath $ConfigPath) {
+        $OldText = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
     }
 
-    Write-Host "pip was not found. Trying python -m ensurepip --upgrade..."
-    & $Python -m ensurepip --upgrade
-    if ($LASTEXITCODE -ne 0) {
-        throw "pip is unavailable and ensurepip failed. Install pip for this Python, then re-run this installer."
+    $Block = New-HookBlock $RelayExe $Launcher
+    $NewText = Merge-HookBlock $OldText $Block
+    Set-Content -LiteralPath $ConfigPath -Value $NewText.TrimEnd() -Encoding UTF8
+    Write-Host "BACKUP_PATH=$BackupPath"
+}
+
+function Assert-FileExists {
+    param(
+        [string]$Path,
+        [string]$Message
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw $Message
     }
 }
 
-function Ensure-Hidapi {
-    param([string]$Python)
-
-    # 依赖已存在时不重复安装，降低普通用户重复执行安装提示词时的失败概率。
-    & $Python -c "import hid" 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "hidapi is already installed for this Python."
-        return
-    }
-
-    Ensure-Pip $Python
-    Write-Host "Installing Python dependency: hidapi"
-    & $Python -m pip install hidapi
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install hidapi. Check network access or install it manually with: $Python -m pip install hidapi"
-    }
-}
-
-function Resolve-PythonwCommand {
-    param([string]$Python)
-
-    # Windows hook 使用 pythonw/pyw 可避免 daemon/relay 拉起时出现额外控制台窗口。
-    $PythonCommand = Get-Command $Python -ErrorAction SilentlyContinue
-    if ($PythonCommand -and $PythonCommand.Path) {
-        $PythonwCandidate = Join-Path (Split-Path -Parent $PythonCommand.Path) "pythonw.exe"
-        if (Test-Path -LiteralPath $PythonwCandidate) {
-            return $PythonwCandidate
-        }
-    }
-    foreach ($Candidate in @("pyw", "pythonw")) {
-        $Found = Get-Command $Candidate -ErrorAction SilentlyContinue
-        if ($Found) {
-            return $Candidate
-        }
-    }
-    return "pythonw"
-}
+Assert-Windows
 
 if (-not $CodexHome) {
     if ($env:CODEX_HOME) {
@@ -126,47 +183,32 @@ if (-not $CodexHome) {
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RelaySource = Join-Path $ScriptDir "codex_hook_relay.py"
-$DaemonSource = Join-Path $ScriptDir "codex_screen_daemon.py"
-$StateSource = Join-Path $ScriptDir "codex_state_manager.py"
-$QuotaSource = Join-Path $ScriptDir "codex_quota_client.py"
-$LogSource = Join-Path $ScriptDir "codex_screen_log.py"
+$RepoRoot = Split-Path -Parent $ScriptDir
+$BinDir = Join-Path $RepoRoot "bin\windows-x64"
+$RelaySource = Join-Path $BinDir "codex_hook_relay.exe"
+$DaemonSource = Join-Path $BinDir "codex_screen_daemon.exe"
 $WindowsLauncherSource = Join-Path $ScriptDir "codex_hook_windows_launcher.ps1"
-$ConfigUpdaterScript = Join-Path $ScriptDir "update_codex_config.py"
-$RelayTarget = Join-Path $TargetDir "codex_hook_relay.py"
-$DaemonTarget = Join-Path $TargetDir "codex_screen_daemon.py"
-$StateTarget = Join-Path $TargetDir "codex_state_manager.py"
-$QuotaTarget = Join-Path $TargetDir "codex_quota_client.py"
-$LogTarget = Join-Path $TargetDir "codex_screen_log.py"
+$RelayTarget = Join-Path $TargetDir "codex_hook_relay.exe"
+$DaemonTarget = Join-Path $TargetDir "codex_screen_daemon.exe"
 $WindowsLauncherTarget = Join-Path $TargetDir "codex_hook_windows_launcher.ps1"
-$Python = Resolve-PythonCommand
-$Pythonw = Resolve-PythonwCommand $Python
 $ConfigPath = Join-Path $CodexHome "config.toml"
+
+Assert-FileExists $RelaySource "Missing packaged relay exe: $RelaySource"
+Assert-FileExists $DaemonSource "Missing packaged daemon exe: $DaemonSource"
+Assert-FileExists $WindowsLauncherSource "Missing Windows hook launcher: $WindowsLauncherSource"
 
 New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
 Copy-Item -LiteralPath $RelaySource -Destination $RelayTarget -Force
 Copy-Item -LiteralPath $DaemonSource -Destination $DaemonTarget -Force
-Copy-Item -LiteralPath $StateSource -Destination $StateTarget -Force
-Copy-Item -LiteralPath $QuotaSource -Destination $QuotaTarget -Force
-Copy-Item -LiteralPath $LogSource -Destination $LogTarget -Force
 Copy-Item -LiteralPath $WindowsLauncherSource -Destination $WindowsLauncherTarget -Force
 
-if (-not $SkipPipInstall) {
-    Ensure-Hidapi $Python
+& $DaemonTarget --self-test | Out-Host
+if (-not $?) {
+    throw "Daemon self-test failed."
 }
 
-& $Python -m py_compile $RelayTarget $DaemonTarget $StateTarget $QuotaTarget $LogTarget $ConfigUpdaterScript
-& $Python $DaemonTarget --self-test | Out-Host
-
 if (-not $SkipConfigUpdate) {
-    # The Python helper backs up config.toml before writing hooks and validates TOML.
-    if (-not (Test-Path -LiteralPath $ConfigUpdaterScript)) {
-        throw "Config updater script not found: $ConfigUpdaterScript"
-    }
-    & $Python $ConfigUpdaterScript $ConfigPath $RelayTarget $Pythonw $HookProfile
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to update Codex config.toml."
-    }
+    Update-CodexConfig $ConfigPath $RelayTarget $WindowsLauncherTarget
 }
 
 Write-Host "Installed Codex screen hook files to $TargetDir"
@@ -175,6 +217,6 @@ if ($SkipConfigUpdate) {
 } else {
     Write-Host "Updated Codex config.toml at $ConfigPath"
     Write-Host "Installed hook profile: $HookProfile"
-    Write-Host "Backup status was printed as BACKUP_PATH above; empty means a new config was created."
 }
+
 

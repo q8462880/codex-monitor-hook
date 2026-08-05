@@ -1,8 +1,6 @@
-param(
-    [Parameter(Mandatory = $true)]
+﻿param(
+    [string]$RelayExe,
     [string]$Pythonw,
-
-    [Parameter(Mandatory = $true)]
     [string]$Relay
 )
 
@@ -10,7 +8,8 @@ $ErrorActionPreference = "Stop"
 
 # Codex 的 Windows command hook 会先创建一个 pwsh 控制台。
 # 这个脚本在同一个进程内隐藏控制台，避免每次提交提示词时闪出黑窗口。
-# Python relay 仍然由 pythonw.exe 执行，不会创建新的控制台窗口。
+# 新安装使用 relay exe；旧 Codex 会话可能仍缓存 -Pythonw/-Relay 参数。
+# 两种参数都兼容，避免用户更新后、重启 Codex 前 hook 立即失败。
 $newLine = [Environment]::NewLine
 $windowApiSource = 'using System;' + $newLine +
     'using System.Runtime.InteropServices;' + $newLine +
@@ -28,5 +27,15 @@ if ($consoleHandle -ne [IntPtr]::Zero) {
     [CodexHookWindow]::ShowWindow($consoleHandle, 0) | Out-Null
 }
 
-& $Pythonw $Relay
-exit $LASTEXITCODE
+if ($RelayExe) {
+    & $RelayExe
+    exit $LASTEXITCODE
+}
+
+if ($Pythonw -and $Relay) {
+    & $Pythonw $Relay
+    exit $LASTEXITCODE
+}
+
+throw "RelayExe is required."
+

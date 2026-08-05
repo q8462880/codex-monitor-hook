@@ -499,9 +499,14 @@ class CodexScreenDaemon:
             self.last_frame_written_at = now
 
     def _ensure_hid(self):
-        if self.hid is not None: return self.hid
-        try: import hid  # type: ignore
-        except Exception as exc: raise RuntimeError("hidapi 未安装，请先执行 python -m pip install hidapi") from exc
+        if self.hid is not None:
+            return self.hid
+        try:
+            import hid  # type: ignore
+        except Exception as exc:
+            if getattr(sys, "frozen", False):
+                raise RuntimeError("打包程序缺少 HID 运行组件，请重新下载安装包") from exc
+            raise RuntimeError("hidapi 未安装，请先执行 python -m pip install hidapi") from exc
         self.hid = hid
         return hid
 

@@ -19,8 +19,7 @@ from update_codex_config import (
 class HookConfigTest(unittest.TestCase):
     def test_builds_all_supported_lifecycle_hooks(self):
         block = build_hook_block(
-            r"C:\Users\test\.codex_screen\codex_hook_relay.py",
-            r"D:\Python\pythonw.exe",
+            r"C:\Users\test\.codex_screen\codex_hook_relay.exe",
         )
 
         for event_name in HOOK_EVENTS:
@@ -29,8 +28,9 @@ class HookConfigTest(unittest.TestCase):
 
         self.assertEqual(len(HOOK_EVENTS), block.count('type = "command"'))
         self.assertNotIn("python.exe", block)
+        self.assertNotIn("pythonw.exe", block)
         self.assertIn(
-            r"""commandWindows = '& "C:\Users\test\.codex_screen\codex_hook_windows_launcher.ps1" -Pythonw "D:\Python\pythonw.exe" -Relay "C:\Users\test\.codex_screen\codex_hook_relay.py"'""",
+            r"""commandWindows = '& "C:\Users\test\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\test\.codex_screen\codex_hook_relay.exe"'""",
             block,
         )
         self.assertEqual(1, block.count("# BEGIN codex-monitor-hook"))
@@ -38,8 +38,7 @@ class HookConfigTest(unittest.TestCase):
 
     def test_builds_minimal_hooks_for_performance_mode(self):
         block = build_hook_block(
-            r"C:\Users\test\.codex_screen\codex_hook_relay.py",
-            r"D:\Python\pythonw.exe",
+            r"C:\Users\test\.codex_screen\codex_hook_relay.exe",
             hook_profile="minimal",
         )
 

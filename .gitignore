@@ -17,6 +17,7 @@ env/
 *.tmp
 *.bak
 .tmp-install/
+.tmp-exe-install/
 
 # 编辑器与系统文件
 .idea/
