@@ -75,8 +75,12 @@ Codex `config.toml`, so always preserve the automatic backup created by `scripts
 
    ```powershell
    Set-Location $Target
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -HookProfile full
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -HookProfile full -InstallPythonIfMissing
    ```
+
+   The Windows installer automatically checks Python, bootstraps `pip` with `ensurepip` when needed,
+   and installs the only Python package dependency, `hidapi`. If Python is missing, it tries a
+   current-user `winget` install when `-InstallPythonIfMissing` is present.
 
    macOS/Linux shell:
 
