@@ -158,10 +158,10 @@ or `modified` are not executable until the user reviews and trusts them in Setti
 ## Firmware Protocol Note
 
 The daemon opens the Codex Micro-compatible device at `VID=0x303A`, `PID=0x8360`,
-selecting the daemon-only vendor-defined collection `usage_page=0xFF01`, `usage=0x01`
-(the daemon-only `MI_02` interface). The collection is Output-only and uses
-Report ID `0x07`: `hidapi.write()` receives 1024 bytes total, with `0x07` as the
-first byte and the first 1023 bytes of the firmware's 1024-byte Monitor payload
-following it. The payload begins with `0x24, 0x01, 0x01` and contains status, icon
-code, current/weekly usage percentages and reset seconds; the firmware restores
-the final missing byte as zero before parsing.
+selecting the daemon-only `MI_02` Monitor collection rather than keyboard `MI_00` or
+JSON-RPC `MI_01`. The Monitor descriptor is `FF01/01`, Report ID `0x07`, 1024 bytes
+total. Windows exposes it through `hidapi`; current macOS does not register this
+Output-only interface in IOHID, so the daemon opens USB interface 2 through IOUSBLib
+and writes its 1024-byte interrupt OUT endpoint directly. Both platforms send the
+same payload beginning with `0x24, 0x01, 0x01`; platform-specific code only changes
+how the same Monitor report reaches `MI_02`.

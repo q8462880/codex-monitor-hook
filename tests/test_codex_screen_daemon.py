@@ -4,13 +4,14 @@ import unittest
 import queue
 import socket
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import codex_screen_daemon as daemon
+import codex_macos_usb
 from codex_quota_client import INTERNAL_QUOTA_EVENT
 from codex_state_manager import CodexStateManager
 
@@ -255,7 +256,7 @@ class CodexScreenDaemonTest(unittest.TestCase):
 
         self.assertIs(devices[1], selected)
 
-    def test_codex_daemon_selects_macos_monitor_collection(self):
+    def test_codex_daemon_rejects_macos_rpc_collection_as_monitor(self):
         instance = daemon.CodexScreenDaemon(frame_seq=1)
         devices = [
             {"usage_page": 0x0001, "usage": 0x0006, "interface_number": 0},
@@ -264,7 +265,112 @@ class CodexScreenDaemonTest(unittest.TestCase):
 
         selected = instance._pick_device(devices)
 
-        self.assertIs(devices[1], selected)
+        self.assertIsNone(selected)
+
+    def test_macos_uses_raw_interface_two_when_hidapi_hides_monitor(self):
+        devices = [
+            {"usage_page": 0x0001, "usage": 0x0006, "interface_number": 0},
+            {"usage_page": 0xFF00, "usage": 0x0061, "interface_number": 1},
+        ]
+
+        class MacHid:
+            @staticmethod
+            def enumerate(_vendor_id, _product_id):
+                return devices
+
+        raw_device = MagicMock()
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        instance.hid = MacHid()
+        with patch.object(daemon.sys, "platform", "darwin"), patch.object(
+            codex_macos_usb, "MacOSRawHIDDevice", return_value=raw_device
+        ) as raw_factory, patch.object(daemon, "log_line"):
+            self.assertTrue(instance._open_device())
+
+        raw_factory.assert_called_once_with(
+            daemon.HID_VENDOR_ID,
+            daemon.HID_PRODUCT_ID,
+            daemon.HID_INTERFACE_NUMBER,
+            daemon.HID_TRANSFER_SIZE,
+        )
+        raw_device.open.assert_called_once_with()
+        self.assertIs(raw_device, instance.dev)
+
+    def test_windows_keeps_hidapi_interface_two_transport(self):
+        monitor = {
+            "path": b"windows-mi-02",
+            "usage_page": 0xFF01,
+            "usage": 0x0001,
+            "interface_number": 2,
+        }
+
+        class WindowsDevice:
+            def __init__(self):
+                self.opened_path = None
+
+            def open_path(self, path):
+                self.opened_path = path
+
+            def set_nonblocking(self, _enabled):
+                pass
+
+        device = WindowsDevice()
+
+        class WindowsHid:
+            @staticmethod
+            def enumerate(_vendor_id, _product_id):
+                return [
+                    {"usage_page": 0xFF00, "usage": 0x0061, "interface_number": 1},
+                    monitor,
+                ]
+
+            @staticmethod
+            def device():
+                return device
+
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        instance.hid = WindowsHid()
+        with patch.object(daemon.sys, "platform", "win32"), patch.object(
+            daemon, "log_line"
+        ):
+            self.assertTrue(instance._open_device())
+
+        self.assertEqual(monitor["path"], device.opened_path)
+        self.assertIs(device, instance.dev)
+
+    def test_windows_monitor_frame_keeps_quota_and_reset_fields(self):
+        class WritableDevice:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(bytes(data))
+                return len(data)
+
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        instance.dev = WritableDevice()
+        with patch.object(daemon.sys, "platform", "win32"), patch.object(
+            daemon, "log_line"
+        ):
+            instance._apply_event(
+                {
+                    "_internal_kind": INTERNAL_QUOTA_EVENT,
+                    "quota_text": "codex current=42 weekly=11",
+                    "current_used_percent": 42,
+                    "weekly_used_percent": 11,
+                    "current_reset_sec": 3600,
+                    "weekly_reset_sec": 86400,
+                }
+            )
+            instance._write_frame(force=True)
+
+        raw = instance.dev.writes[0]
+        self.assertEqual(1024, len(raw))
+        self.assertEqual(0x07, raw[0])
+        self.assertEqual(0x24, raw[1])
+        self.assertEqual(42, raw[11])
+        self.assertEqual(11, raw[12])
+        self.assertEqual(3600, int.from_bytes(raw[13:17], "little"))
+        self.assertEqual(86400, int.from_bytes(raw[17:21], "little"))
 
     def test_codex_daemon_does_not_fallback_to_unknown_hid_collection(self):
         instance = daemon.CodexScreenDaemon(frame_seq=1)
@@ -280,10 +386,12 @@ class CodexScreenDaemonTest(unittest.TestCase):
 
         instance = daemon.CodexScreenDaemon(frame_seq=1)
         instance.hid = EmptyHid()
-        with patch.object(daemon, "log_line") as log:
+        with patch.object(daemon.sys, "platform", "win32"), patch.object(
+            daemon, "log_line"
+        ) as log:
             self.assertFalse(instance._open_device())
 
-        self.assertIn("HID device not found", log.call_args.args[1])
+        self.assertIn("HID monitor collection not found", log.call_args.args[1])
 
     def test_hid_heartbeat_is_due_without_new_hook_event(self):
         instance = daemon.CodexScreenDaemon(frame_seq=1)

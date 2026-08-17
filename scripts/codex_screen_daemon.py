@@ -49,16 +49,8 @@ HID_VENDOR_ID = 0x303A
 HID_PRODUCT_ID = 0x8360
 HID_USAGE_PAGE = 0xFF01
 HID_USAGE = 0x01
-# macOS 的 hidapi 会把同一固件 collection 枚举为 FF00/0x61；这是
-# 当前 Codex Micro 在 macOS 上实际暴露的 daemon 输出接口。两组值都必须
-# 显式匹配，不能在找不到目标时回退到 devices[0]，否则可能误打开键盘接口。
-HID_MACOS_USAGE_PAGE = 0xFF00
-HID_MACOS_USAGE = 0x61
-HID_COLLECTION_CANDIDATES = (
-    (HID_USAGE_PAGE, HID_USAGE),
-    (HID_MACOS_USAGE_PAGE, HID_MACOS_USAGE),
-)
-# Monitor 业务帧仍为 1024 字节；HID Report ID 复用其中 1 字节，
+HID_INTERFACE_NUMBER = 2
+# FF01/01 的 Monitor 业务帧为 1024 字节；HID Report ID 复用其中 1 字节，
 # 所以实际 hidapi.write() 总长度也是 1024，而不是旧协议的 1025。
 HID_REPORT_SIZE = 1024
 HID_REPORT_ID = 0x07
@@ -669,23 +661,17 @@ class CodexScreenDaemon:
     def _open_device(self) -> bool:
         hid = self._ensure_hid()
         devices = hid.enumerate(HID_VENDOR_ID, HID_PRODUCT_ID)
-        if not devices:
-            self._log_hid_unavailable(
-                f"HID device not found vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
-            )
-            return False
         info = self._pick_device(devices)
-        if info is None:
-            available = ",".join(
-                f"0x{int(item.get('usage_page') or 0):04X}/"
-                f"0x{int(item.get('usage') or 0):02X}"
-                for item in devices
-            )
-            self._log_hid_unavailable(
-                "HID monitor collection not found; "
-                f"available={available or '-'}"
-            )
-            return False
+        if info is not None:
+            return self._open_hidapi_device(hid, info)
+        if sys.platform == "darwin":
+            return self._open_macos_raw_device(devices)
+        self._log_missing_monitor_collection(devices)
+        return False
+
+    def _open_hidapi_device(self, hid: Any, info: Dict[str, Any]) -> bool:
+        """Windows 可直接枚举 MI_02，必须保持已验证的 hidapi 路径。"""
+
         dev = hid.device()
         try:
             dev.open_path(info["path"])
@@ -706,10 +692,52 @@ class CodexScreenDaemon:
                 f"HID opened vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
                 f" usage=0x{int(info.get('usage_page') or 0):04X}/"
                 f"0x{int(info.get('usage') or 0):02X}"
-                f" interface={info.get('interface_number', '-')}",
+                f" interface={info.get('interface_number', '-')}"
+                f" report=0x{HID_REPORT_ID:02X}/{HID_TRANSFER_SIZE}"
+                " transport=hidapi",
             )
             self.last_hid_open_log_at = now
         return True
+
+    def _open_macos_raw_device(self, devices: List[Dict[str, Any]]) -> bool:
+        """macOS 不注册 Output-only MI_02 到 IOHID，改从 IOUSBLib 打开。"""
+
+        from codex_macos_usb import MacOSRawHIDDevice
+
+        dev = MacOSRawHIDDevice(
+            HID_VENDOR_ID, HID_PRODUCT_ID, HID_INTERFACE_NUMBER, HID_TRANSFER_SIZE
+        )
+        try:
+            dev.open()
+        except Exception as exc:
+            self._log_missing_monitor_collection(devices, str(exc))
+            return False
+        self.dev = dev
+        now = time.monotonic()
+        if now - self.last_hid_open_log_at >= HID_FAILURE_LOG_INTERVAL_SEC:
+            log_line(
+                "daemon",
+                f"HID opened vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
+                f" usage=0x{HID_USAGE_PAGE:04X}/0x{HID_USAGE:02X}"
+                f" interface={HID_INTERFACE_NUMBER}"
+                f" report=0x{HID_REPORT_ID:02X}/{HID_TRANSFER_SIZE}"
+                " transport=macos-raw-usb",
+            )
+            self.last_hid_open_log_at = now
+        return True
+
+    def _log_missing_monitor_collection(
+        self, devices: List[Dict[str, Any]], detail: str = ""
+    ) -> None:
+        available = ",".join(
+            f"0x{int(item.get('usage_page') or 0):04X}/"
+            f"0x{int(item.get('usage') or 0):02X}"
+            for item in devices
+        )
+        suffix = f" raw_error={_short(detail, 120)}" if detail else ""
+        self._log_hid_unavailable(
+            f"HID monitor collection not found; available={available or '-'}{suffix}"
+        )
 
     def _log_hid_unavailable(self, message: str) -> None:
         """限频记录枚举或打开失败，避免 USB 重连循环刷满日志。"""
@@ -721,13 +749,12 @@ class CodexScreenDaemon:
         self.last_hid_unavailable_log_at = now
 
     def _pick_device(self, devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        for usage_page, usage in HID_COLLECTION_CANDIDATES:
-            for info in devices:
-                if (
-                    int(info.get("usage_page") or 0) == usage_page
-                    and int(info.get("usage") or 0) == usage
-                ):
-                    return info
+        for info in devices:
+            if (
+                int(info.get("usage_page") or 0) == HID_USAGE_PAGE
+                and int(info.get("usage") or 0) == HID_USAGE
+            ):
+                return info
         return None
 
     def _close_device(self) -> None:
