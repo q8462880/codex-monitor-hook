@@ -7,15 +7,31 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from codex_screen_log import log_line
 from codex_quota_client import (
+    INTERNAL_DAEMON_SHUTDOWN_EVENT,
+    INTERNAL_QUOTA_REFRESH_EVENT,
+    INTERNAL_QUOTA_UNAVAILABLE_EVENT,
     is_quota_update_event,
+    is_quota_refresh_event,
     start_quota_poller,
     stop_quota_poller,
+)
+from codex_hook_diagnostics import (
+    diagnose_codex_hooks,
+    format_hook_diagnostic,
+    hook_diagnostic_exit_code,
+)
+from codex_runtime_config import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    get_candidate_ports,
+    write_active_port,
 )
 from codex_state_manager import (
     EVENT_STATE_MAP,
     STATE_COMPACTING,
     STATE_EXECUTING,
     STATE_IDLE,
+    STATE_READY,
     STATE_SUBAGENT,
     STATE_THINKING,
     STATE_WAIT_PERM,
@@ -23,16 +39,25 @@ from codex_state_manager import (
 )
 # ===== 配置区 =====
 BASE_DIR = Path.home() / ".codex_screen"
-HOST = "127.0.0.1"
-PORT = 12688
-HID_VENDOR_ID = 0x1CA9
-HID_PRODUCT_ID = 0x1305
-HID_USAGE_PAGE = 0xFF00
+HOST = DEFAULT_HOST
+PORT = DEFAULT_PORT
+# Codex 模式下的 MI_02 是 daemon 专用 Output-only HID collection，使用
+# 独立 usage page，避免 Codex Desktop 的原生设备扫描把它当成 RPC 接口。
+# MI_00 是键盘，MI_01 是桌面端 RPC，不能用 VID/PID 的默认 open() 代替
+# open_path()，否则 hidapi 可能误打开键盘接口。
+HID_VENDOR_ID = 0x303A
+HID_PRODUCT_ID = 0x8360
+HID_USAGE_PAGE = 0xFF01
 HID_USAGE = 0x01
+# Monitor 业务帧仍为 1024 字节；HID Report ID 复用其中 1 字节，
+# 所以实际 hidapi.write() 总长度也是 1024，而不是旧协议的 1025。
 HID_REPORT_SIZE = 1024
-HID_REPORT_ID = 0x00
-# 固件的 Output Report 通过 hidapi 需要额外带 1 字节 report_id=0，
-# 因此 _render_frame() 返回 1024 字节协议报文，_write_frame() 再在前面补 0。
+HID_REPORT_ID = 0x07
+HID_OUTPUT_PAYLOAD_SIZE = HID_REPORT_SIZE - 1
+HID_TRANSFER_SIZE = HID_REPORT_SIZE
+HID_INPUT_ENABLED = False
+# 固件的 Output Report 通过 hidapi 需要首字节带 report_id=0x07。
+# _render_frame() 返回 1024 字节协议报文，写入时保留前 1023 字节。
 HID_PROTOCOL_READY = True
 SCREEN_HID_PROTOCOL_VERSION = 0x01
 SCREEN_HID_CMD_CODEX_MONITOR = 0x24
@@ -51,9 +76,16 @@ SCREEN_HID_CODEX_STATUS_EXECUTING = 0x02
 SCREEN_HID_CODEX_STATUS_WAIT_PERM = 0x03
 SCREEN_HID_CODEX_STATUS_COMPACTING = 0x04
 SCREEN_HID_CODEX_STATUS_SUBAGENT = 0x05
+SCREEN_HID_CODEX_STATUS_READY = 0x06
 SCREEN_HID_CODEX_STATUS_OFFLINE = 0xE0
 SCREEN_HID_CODEX_STATUS_ERROR = 0xE1
 IDLE_TIMEOUT_SEC = 600
+HOOK_STALE_TIMEOUT_SEC = float(
+    os.environ.get(
+        "CODEX_SCREEN_HOOK_STALE_TIMEOUT_SEC",
+        os.environ.get("CODEX_SCREEN_TURN_STALE_TIMEOUT_SEC", "120"),
+    )
+)
 ACCEPT_TIMEOUT_SEC = 1.0
 DEVICE_POLL_TIMEOUT_MS = 50
 HID_HEARTBEAT_INTERVAL_SEC = 5.0
@@ -66,8 +98,13 @@ FRAME_SEQ_STATE_FILE = BASE_DIR / "codex_monitor_frame_seq"
 DAEMON_LOCK_FILE = BASE_DIR / "codex_screen_daemon.lock"
 DEFAULT_QUOTA_TEXT = os.environ.get("CODEX_SCREEN_QUOTA_TEXT", "quota: --")
 QUEUE_MAX_ITEMS = 256
+INTERNAL_TURN_TIMEOUT = "__hook_timeout__"
+QUOTA_REFRESH_MIN_INTERVAL_SEC = float(
+    os.environ.get("CODEX_SCREEN_QUOTA_HOOK_MIN_INTERVAL_SEC", "15")
+)
 STATUS_CODE_MAP = {
     STATE_IDLE: SCREEN_HID_CODEX_STATUS_IDLE,
+    STATE_READY: SCREEN_HID_CODEX_STATUS_READY,
     STATE_THINKING: SCREEN_HID_CODEX_STATUS_THINKING,
     STATE_EXECUTING: SCREEN_HID_CODEX_STATUS_EXECUTING,
     STATE_WAIT_PERM: SCREEN_HID_CODEX_STATUS_WAIT_PERM,
@@ -76,6 +113,7 @@ STATUS_CODE_MAP = {
 }
 ICON_CODE_MAP = {
     STATE_IDLE: 0x00,
+    STATE_READY: 0x06,
     STATE_THINKING: 0x01,
     STATE_EXECUTING: 0x02,
     STATE_WAIT_PERM: 0x03,
@@ -225,10 +263,10 @@ def _reserve_frame_seq() -> int:
         return max(1, seed)
 
 
-class CodexScreenDaemon:
-    def __init__(self) -> None:
-        self.state_manager = CodexStateManager()
-        self.state = {
+def _new_default_state(frame_seq: int) -> Dict[str, Any]:
+    """创建屏幕状态初始值；测试可传固定序号避免写用户目录。"""
+
+    return {
             "status": STATE_IDLE,
             "quota_text": DEFAULT_QUOTA_TEXT,
             "session_id": "-",
@@ -240,7 +278,7 @@ class CodexScreenDaemon:
             "last_event": "INIT",
             "updated_at": time.time(),
             "raw_event": {},
-            "frame_seq": _reserve_frame_seq(),
+            "frame_seq": frame_seq,
             "current_used_percent": SCREEN_HID_CODEX_PERCENT_INVALID,
             "weekly_used_percent": SCREEN_HID_CODEX_PERCENT_INVALID,
             "current_reset_sec": SCREEN_HID_CODEX_RESET_INVALID,
@@ -248,6 +286,14 @@ class CodexScreenDaemon:
             "session_active": False,
             "turn_active": False,
         }
+
+
+class CodexScreenDaemon:
+    def __init__(self, frame_seq: Optional[int] = None) -> None:
+        self.state_manager = CodexStateManager()
+        self.state = _new_default_state(
+            _reserve_frame_seq() if frame_seq is None else frame_seq
+        )
         self.queue: "queue.Queue[Dict[str, Any]]" = BoundedStateQueue(QUEUE_MAX_ITEMS)
         self.stop = threading.Event()
         self.last_activity = time.monotonic()
@@ -258,10 +304,15 @@ class CodexScreenDaemon:
         self.last_frame_written_at = 0.0
         self.lock = threading.Lock()
         self.last_hid_open_log_at = 0.0
+        self.last_hid_unavailable_log_at = 0.0
         self.last_hid_failure_log_at = 0.0
         self.hid_failure_count = 0
         self.hid_disabled_logged = False
         self.quota_thread: Optional[threading.Thread] = None
+        self.quota_refresh_event = threading.Event()
+        self.last_quota_refresh_requested_at = 0.0
+        self.turn_timeout_pending = False
+        self.listen_port = PORT
 
     def run(self) -> int:
         with _daemon_instance_lock() as acquired:
@@ -270,12 +321,16 @@ class CodexScreenDaemon:
                 return 0
             try: self.server = self._bind()
             except OSError as exc:
-                log_line("daemon", f"port {HOST}:{PORT} busy: {exc}")
+                log_line("daemon", f"no available localhost port: {exc}")
                 return 0
             self._install_signals()
             threading.Thread(target=self._device_loop, name="codex-screen-device", daemon=True).start()
             threading.Thread(target=self._idle_watchdog, name="codex-screen-watchdog", daemon=True).start()
-            self.quota_thread = start_quota_poller(self.queue, self.stop)
+            self.quota_thread = start_quota_poller(
+                self.queue,
+                self.stop,
+                self.quota_refresh_event,
+            )
             try: self._accept_loop()
             finally:
                 self.stop.set()
@@ -285,12 +340,33 @@ class CodexScreenDaemon:
             return 0
 
     def _bind(self) -> socket.socket:
+        last_error: Optional[OSError] = None
+        for port in get_candidate_ports():
+            try:
+                server = self._bind_port(port)
+            except OSError as exc:
+                last_error = exc
+                log_line("daemon", f"port {HOST}:{port} unavailable: {exc}")
+                continue
+            actual_port = int(server.getsockname()[1])
+            self.listen_port = actual_port
+            write_active_port(BASE_DIR, HOST, actual_port, os.getpid())
+            log_line("daemon", f"listening {HOST}:{actual_port}")
+            return server
+        raise last_error or OSError("no port candidates")
+
+    def _bind_port(self, port: int) -> socket.socket:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"): server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        server.bind((HOST, PORT))
-        server.listen(4)
-        server.settimeout(ACCEPT_TIMEOUT_SEC)
-        return server
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            server.bind((HOST, port))
+            server.listen(4)
+            server.settimeout(ACCEPT_TIMEOUT_SEC)
+            return server
+        except OSError:
+            server.close()
+            raise
 
     def _install_signals(self) -> None:
         def handler(*_: Any) -> None: self.stop.set()
@@ -384,10 +460,11 @@ class CodexScreenDaemon:
                 self._write_frame()
             elif self._heartbeat_due():
                 self._refresh_heartbeat()
-                self._write_frame(force=True)
+                self._write_frame(force=True, heartbeat=True)
             if self.dev is None:
                 time.sleep(backoff); backoff = min(backoff * 1.5, RECONNECT_BACKOFF_MAX_SEC); continue
-            self._poll_input()
+            if HID_INPUT_ENABLED:
+                self._poll_input()
             if self.dev is None: time.sleep(backoff); backoff = min(backoff * 1.5, RECONNECT_BACKOFF_MAX_SEC)
 
     def _drain_queue(self) -> bool:
@@ -405,12 +482,41 @@ class CodexScreenDaemon:
         return dirty
 
     def _apply_event(self, event: Dict[str, Any]) -> None:
+        if event.get("_internal_kind") == INTERNAL_DAEMON_SHUTDOWN_EVENT:
+            log_line("daemon", "shutdown requested by SessionEnd hook")
+            self.stop.set()
+            return
+
+        if event.get("_internal_kind") == INTERNAL_TURN_TIMEOUT:
+            self.turn_timeout_pending = False
+            if self.state_manager.expire_stale_status(HOOK_STALE_TIMEOUT_SEC):
+                self.state["status"] = self.state_manager.status
+                self.state["last_event"] = self.state_manager.last_event
+                self.state["updated_at"] = time.time()
+                self.state["turn_active"] = self.state_manager.turn_active
+                self.state["turn_id"] = _short(self.state_manager.last_turn_id, 64)
+                self._advance_frame_seq()
+                log_line("daemon", "state=READY event=HookTimeout")
+            return
+
+        if is_quota_refresh_event(event):
+            self._request_quota_refresh()
+            return
+
         if is_quota_update_event(event):
             self._apply_quota_fields(event)
             self.state["quota_text"] = _short(event.get("quota_text"), 96)
             self.state["updated_at"] = time.time()
             self._advance_frame_seq()
             log_line("daemon", f"quota updated: {self.state['quota_text']}")
+            return
+
+        if event.get("_internal_kind") == INTERNAL_QUOTA_UNAVAILABLE_EVENT:
+            self._clear_quota_fields()
+            self.state["updated_at"] = time.time()
+            self._advance_frame_seq()
+            reason = _short(event.get("reason"), 160)
+            log_line("quota", f"quota hidden: {reason}")
             return
 
         name = str(event.get("hook_event_name") or event.get("event") or "UNKNOWN")
@@ -458,6 +564,16 @@ class CodexScreenDaemon:
             f"state={self.state['status']} event={name} latency={latency}",
         )
 
+    def _request_quota_refresh(self) -> None:
+        """由少量 Hook 请求额度刷新，不改变屏幕运行状态。"""
+
+        now = time.monotonic()
+        if now - self.last_quota_refresh_requested_at < QUOTA_REFRESH_MIN_INTERVAL_SEC:
+            return
+        self.last_quota_refresh_requested_at = now
+        self.quota_refresh_event.set()
+        log_line("quota", "refresh requested by hook")
+
     def _apply_quota_fields(self, event: Dict[str, Any]) -> None:
         quota = event.get("quota")
         source = quota if isinstance(quota, dict) else event
@@ -475,6 +591,15 @@ class CodexScreenDaemon:
                 if "percent" in key
                 else _normalize_reset_sec(value)
             )
+
+    def _clear_quota_fields(self) -> None:
+        """账户或接口无法读取额度时隐藏所有额度字段，避免显示陈旧数值。"""
+
+        self.state["quota_text"] = ""
+        self.state["current_used_percent"] = SCREEN_HID_CODEX_PERCENT_INVALID
+        self.state["weekly_used_percent"] = SCREEN_HID_CODEX_PERCENT_INVALID
+        self.state["current_reset_sec"] = SCREEN_HID_CODEX_RESET_INVALID
+        self.state["weekly_reset_sec"] = SCREEN_HID_CODEX_RESET_INVALID
 
     def _advance_frame_seq(self) -> None:
         self.state["frame_seq"] = (self.state["frame_seq"] + 1) & 0xFFFFFFFF
@@ -513,17 +638,25 @@ class CodexScreenDaemon:
     def _open_device(self) -> bool:
         hid = self._ensure_hid()
         devices = hid.enumerate(HID_VENDOR_ID, HID_PRODUCT_ID)
-        if not devices: return False
+        if not devices:
+            self._log_hid_unavailable(
+                f"HID device not found vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
+            )
+            return False
         info = self._pick_device(devices)
-        if info is None: return False
+        if info is None:
+            self._log_hid_unavailable("HID device has no selectable collection")
+            return False
         dev = hid.device()
-        try: dev.open_path(info["path"])
-        except Exception:
-            try: dev.open(HID_VENDOR_ID, HID_PRODUCT_ID)
-            except Exception:
-                try: dev.close()
-                except Exception: pass
-                return False
+        try:
+            dev.open_path(info["path"])
+        except Exception as exc:
+            # 该 VID/PID 下同时存在键盘和 RPC interface。路径打开失败时
+            # 不能退回 open(vid, pid)，否则可能把状态帧写进键盘接口。
+            try: dev.close()
+            except Exception: pass
+            self._log_hid_unavailable(f"HID open_path failed: {exc}")
+            return False
         try: dev.set_nonblocking(False)
         except Exception: pass
         self.dev = dev
@@ -531,10 +664,20 @@ class CodexScreenDaemon:
         if now - self.last_hid_open_log_at >= HID_FAILURE_LOG_INTERVAL_SEC:
             log_line(
                 "daemon",
-                f"HID opened vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}",
+                f"HID opened vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
+                f" usage=0x{HID_USAGE_PAGE:04X}/0x{HID_USAGE:02X}",
             )
             self.last_hid_open_log_at = now
         return True
+
+    def _log_hid_unavailable(self, message: str) -> None:
+        """限频记录枚举或打开失败，避免 USB 重连循环刷满日志。"""
+
+        now = time.monotonic()
+        if now - self.last_hid_unavailable_log_at < HID_FAILURE_LOG_INTERVAL_SEC:
+            return
+        log_line("daemon", message)
+        self.last_hid_unavailable_log_at = now
 
     def _pick_device(self, devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         for info in devices:
@@ -554,7 +697,7 @@ class CodexScreenDaemon:
     def _poll_input(self) -> None:
         dev = self.dev
         if dev is None: return
-        try: data = dev.read(HID_REPORT_SIZE + 1, DEVICE_POLL_TIMEOUT_MS)
+        try: data = dev.read(HID_TRANSFER_SIZE, DEVICE_POLL_TIMEOUT_MS)
         except Exception as exc:
             log_line("daemon", f"HID read failed: {exc}")
             self._close_device()
@@ -563,12 +706,23 @@ class CodexScreenDaemon:
         self._touch()
         log_line("daemon", "device frame received") if bytes(data).startswith(b"\x00CDX1") else log_line("daemon", f"device input bytes={len(data)}")
 
-    def _render_frame(self) -> bytes:
-        frame = bytearray(HID_REPORT_SIZE)
+    def _frame_business_fields(self, heartbeat: bool) -> Dict[str, int]:
+        """计算业务字段；纯心跳必须把所有业务字段标为无效。"""
+
+        if heartbeat:
+            return {
+                "flags": 0,
+                "status": 0xFF,
+                "icon": 0xFF,
+                "current_percent": SCREEN_HID_CODEX_PERCENT_INVALID,
+                "weekly_percent": SCREEN_HID_CODEX_PERCENT_INVALID,
+                "current_reset": SCREEN_HID_CODEX_RESET_INVALID,
+                "weekly_reset": SCREEN_HID_CODEX_RESET_INVALID,
+            }
+
         status = self.state["status"]
         status_code = STATUS_CODE_MAP.get(status, 0xE1)
         flags = SCREEN_HID_CODEX_FLAG_STATUS_VALID
-
         if self.state["current_used_percent"] != SCREEN_HID_CODEX_PERCENT_INVALID:
             flags |= SCREEN_HID_CODEX_FLAG_CURRENT_VALID
         if self.state["weekly_used_percent"] != SCREEN_HID_CODEX_PERCENT_INVALID:
@@ -580,27 +734,43 @@ class CodexScreenDaemon:
         if status_code >= 0xE0:
             flags |= SCREEN_HID_CODEX_FLAG_DEGRADED
 
+        return {
+            "flags": flags,
+            "status": status_code,
+            "icon": ICON_CODE_MAP.get(status, 0xFF),
+            "current_percent": self.state["current_used_percent"],
+            "weekly_percent": self.state["weekly_used_percent"],
+            "current_reset": self.state["current_reset_sec"],
+            "weekly_reset": self.state["weekly_reset_sec"],
+        }
+
+    def _render_frame(self, heartbeat: bool = False) -> bytes:
+        """生成状态帧或只维持固件在线计时的纯心跳帧。"""
+
+        frame = bytearray(HID_REPORT_SIZE)
+        fields = self._frame_business_fields(heartbeat)
+
         frame[0] = SCREEN_HID_CMD_CODEX_MONITOR
         frame[1] = SCREEN_HID_CODEX_SUBCMD_STATE
         frame[2] = SCREEN_HID_PROTOCOL_VERSION
-        frame[3] = flags
+        frame[3] = fields["flags"]
         _put_u32_le(frame, 4, self.state["frame_seq"])
-        frame[8] = status_code
-        frame[9] = ICON_CODE_MAP.get(status, 0xFF)
-        frame[10] = self.state["current_used_percent"]
-        frame[11] = self.state["weekly_used_percent"]
-        _put_u32_le(frame, 12, self.state["current_reset_sec"])
-        _put_u32_le(frame, 16, self.state["weekly_reset_sec"])
+        frame[8] = fields["status"]
+        frame[9] = fields["icon"]
+        frame[10] = fields["current_percent"]
+        frame[11] = fields["weekly_percent"]
+        _put_u32_le(frame, 12, fields["current_reset"])
+        _put_u32_le(frame, 16, fields["weekly_reset"])
         _put_u32_le(frame, 20, int(self.state["updated_at"]))
         return bytes(frame)
 
-    def _write_frame(self, force: bool = False) -> None:
+    def _write_frame(self, force: bool = False, heartbeat: bool = False) -> None:
         dev = self.dev
         if dev is None: return
-        payload = self._render_frame()
-        frame = bytearray(HID_REPORT_SIZE + 1)
+        payload = self._render_frame(heartbeat=heartbeat)
+        frame = bytearray(HID_TRANSFER_SIZE)
         frame[0] = HID_REPORT_ID
-        frame[1:] = payload
+        frame[1:] = payload[:HID_OUTPUT_PAYLOAD_SIZE]
         raw = bytes(frame)
         if not force and raw == self.last_frame: return
         try: written = dev.write(list(raw))
@@ -614,13 +784,16 @@ class CodexScreenDaemon:
             return
         self.last_frame = raw
         self.last_frame_written_at = time.monotonic()
+        frame_kind = "heartbeat" if heartbeat else f"status={self.state['status']}"
         log_line(
             "daemon",
             f"frame written bytes={written}"
-            f" seq={self.state['frame_seq']}"
-            f" status={self.state['status']}",
+            f" seq={self.state['frame_seq']} {frame_kind}",
         )
-        self._touch()
+        # 链路心跳是 daemon 自己产生的，不能把它算成用户活动，否则
+        # 10 分钟空闲退出永远不会触发，后台进程和 HID 会一直被占用。
+        if not heartbeat:
+            self._touch()
 
     def _log_hid_write_failure(self, message: str) -> None:
         """首次记录失败，后续一分钟内合并为一条，避免日志持续刷屏。"""
@@ -640,11 +813,25 @@ class CodexScreenDaemon:
 
     def _idle_watchdog(self) -> None:
         while not self.stop.is_set():
+            self._queue_stale_turn_timeout()
             if time.monotonic() - self.last_activity >= IDLE_TIMEOUT_SEC:
                 log_line("daemon", "idle timeout reached")
                 self.stop.set()
                 return
             time.sleep(2.0)
+
+    def _queue_stale_turn_timeout(self) -> None:
+        """把卡住的 THINKING 回退交给设备线程，避免两个线程同时改状态机。"""
+
+        if HOOK_STALE_TIMEOUT_SEC <= 0 or self.turn_timeout_pending:
+            return
+        if self.state_manager.status == STATE_READY:
+            return
+        age = self.state_manager.active_status_age()
+        if age is None or age < HOOK_STALE_TIMEOUT_SEC:
+            return
+        self.turn_timeout_pending = True
+        self.queue.put({"_internal_kind": INTERNAL_TURN_TIMEOUT})
 
     def _touch(self) -> None: self.last_activity = time.monotonic()
 
@@ -666,8 +853,20 @@ def _elapsed_ms(started_at: Any) -> str:
 
 
 def _self_test() -> str:
-    daemon = CodexScreenDaemon()
-    daemon._apply_event({"hook_event_name": "UserPromptSubmit", "session_id": "session-test", "turn_id": "turn-test", "permission_mode": "acceptEdits", "prompt": "先跑一遍自检。", "quota_text": "quota: 80% remaining"})
+    daemon = CodexScreenDaemon(frame_seq=1)
+    # 自检只验证帧渲染，不写运行日志，避免用户误以为真实 Codex 状态卡在 THINKING。
+    daemon.state["status"] = STATE_THINKING
+    daemon.state["permission_mode"] = "acceptEdits"
+    daemon.state["prompt"] = "self-test"
+    daemon.state["quota_text"] = "quota: 80% remaining"
+    daemon.state["updated_at"] = time.time()
+    daemon._apply_quota_fields(
+        {
+            "current_used_percent": 80,
+            "weekly_used_percent": 20,
+        }
+    )
+    daemon._advance_frame_seq()
     frame = daemon._render_frame()
     return (
         f"codex_frame len={len(frame)} cmd=0x{frame[0]:02X} "
@@ -677,10 +876,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Codex 屏幕常驻服务")
     parser.add_argument("--daemon", action="store_true", help="由 relay 后台拉起时使用")
     parser.add_argument("--self-test", action="store_true", help="仅执行本地渲染自检")
+    parser.add_argument("--diagnose-hooks", metavar="CWD", help="检查 Codex 是否加载并信任 Hook")
+    parser.add_argument("--expected-hook-count", type=int, default=0)
+    parser.add_argument("--hook-diagnostic-timeout", type=float, default=8.0)
     args = parser.parse_args(argv)
     if args.self_test:
         print(_self_test())
         return 0
+    if args.diagnose_hooks:
+        summary = diagnose_codex_hooks(
+            args.diagnose_hooks,
+            timeout_sec=max(0.5, args.hook_diagnostic_timeout),
+        )
+        print(format_hook_diagnostic(summary, args.expected_hook_count))
+        return hook_diagnostic_exit_code(summary, args.expected_hook_count)
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     return CodexScreenDaemon().run()
 if __name__ == "__main__":

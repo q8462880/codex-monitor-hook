@@ -15,6 +15,7 @@ from typing import Dict, Optional
 
 
 STATE_IDLE = "IDLE"
+STATE_READY = "READY"
 STATE_THINKING = "THINKING"
 STATE_WAIT_PERM = "WAIT_PERM"
 STATE_EXECUTING = "EXECUTING"
@@ -107,7 +108,11 @@ class CodexStateManager:
         if event_name == TURN_START_EVENT:
             runtime = self._resolve_runtime_for_turn_start(sid, now)
         else:
-            runtime = self._resolve_runtime(sid, now)
+            runtime = self._resolve_runtime(
+                sid,
+                now,
+                allow_session_takeover=event_name in RUNNING_EVENTS,
+            )
         if runtime is None:
             return False
 
@@ -124,6 +129,50 @@ class CodexStateManager:
 
         self._publish(runtime, event_name, tid)
         return True
+
+    def expire_stale_status(
+        self,
+        timeout_sec: float,
+        now: Optional[float] = None,
+    ) -> bool:
+        """长时间没有任何 Hook 时回到 READY，避免屏幕停在旧状态。"""
+
+        if timeout_sec <= 0:
+            return False
+        now = time.time() if now is None else now
+        runtime = self.sessions.get(self.active_session_id)
+        if runtime is None or runtime.status == STATE_READY:
+            return False
+        if now - runtime.last_event_at < timeout_sec:
+            return False
+
+        runtime.turn_active = False
+        runtime.status = STATE_READY
+        self._publish(runtime, "HookTimeout", runtime.active_turn_id)
+        return True
+
+    def expire_stale_thinking_turn(
+        self,
+        timeout_sec: float,
+        now: Optional[float] = None,
+    ) -> bool:
+        """兼容旧调用名，实际现在检查整个 session 的最后 Hook。"""
+
+        return self.expire_stale_status(timeout_sec, now)
+
+    def active_status_age(self, now: Optional[float] = None) -> Optional[float]:
+        """返回当前 session 最后一次 Hook 的年龄。"""
+
+        runtime = self.sessions.get(self.active_session_id)
+        if runtime is None:
+            return None
+        current = time.time() if now is None else now
+        return max(0.0, current - runtime.last_event_at)
+
+    def active_turn_age(self, now: Optional[float] = None) -> Optional[float]:
+        """兼容旧调用名，返回当前 session 最后 Hook 的年龄。"""
+
+        return self.active_status_age(now)
 
     def _start_session(self, session_id: str, now: float) -> bool:
         if session_id == "-":
@@ -166,14 +215,19 @@ class CodexStateManager:
         self,
         session_id: str,
         now: float,
+        allow_session_takeover: bool = False,
     ) -> Optional[SessionRuntime]:
         if session_id == "-":
             session_id = self.active_session_id
         if session_id == "-":
             return None
 
+        current_runtime = self.sessions.get(self.active_session_id)
         if self.active_session_id not in ("-", session_id):
-            return None
+            if not allow_session_takeover:
+                return None
+            if not self._can_takeover_session(current_runtime):
+                return None
 
         runtime = self.sessions.get(session_id)
         if runtime is None:
@@ -207,15 +261,24 @@ class CodexStateManager:
         return runtime
 
     @staticmethod
+    def _can_takeover_session(runtime: Optional[SessionRuntime]) -> bool:
+        if runtime is None:
+            return True
+        if runtime.turn_active:
+            return False
+        return runtime.status in {STATE_IDLE, STATE_READY}
+
+    @staticmethod
     def _matches_turn(
         runtime: SessionRuntime,
         event_name: str,
         turn_id: str,
     ) -> bool:
         if event_name == TURN_END_EVENT and turn_id == "-":
-            # Stop 必须带当前 turn_id；缺少 turn_id 的结束事件无法证明归属，
-            # 不能把当前正在运行的对话误切回 IDLE。
-            return False
+            # 有些 Codex 客户端的 Stop hook 可能不带 turn_id。
+            # 这里已经先按 active_session_id 过滤过 session，所以只允许它结束
+            # 当前活跃 session 里的当前 turn；旧 session 仍然不能影响新对话。
+            return runtime.turn_active
         if not runtime.turn_active:
             # Stop 后同一个 turn 的迟到 PostToolUse 必须丢弃；
             # 没有活动 turn 时，新的 turn_id 可以隐式开启一轮运行。

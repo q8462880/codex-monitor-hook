@@ -1,6 +1,8 @@
 # 可直接追加到 Codex config.toml。
 # 这是人工参考片段，不要原样复制到另一台机器。
-# Windows 的启动器和 relay exe 路径应由 scripts/install.ps1 按当前用户路径生成。
+# 默认只保留额度刷新所需的 SessionStart 和 UserPromptSubmit。
+# 安装脚本会按当前用户的 Python 和 ~/.codex_screen 路径生成绝对路径。
+# Windows 必须使用 pythonw.exe，避免 Hook 启动时弹出控制台窗口。
 
 # BEGIN codex-monitor-hook
 
@@ -8,87 +10,16 @@
 
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
+command = '"C:\Path\to\pythonw.exe" "C:\Users\YourName\.codex_screen\codex_hook_relay.py"'
+commandWindows = "& 'C:\\Path\\to\\pythonw.exe' 'C:\\Users\\YourName\\.codex_screen\\codex_hook_relay.py'"
 timeout = 5
 
 [[hooks.UserPromptSubmit]]
 
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
+command = '"C:\Path\to\pythonw.exe" "C:\Users\YourName\.codex_screen\codex_hook_relay.py"'
+commandWindows = "& 'C:\\Path\\to\\pythonw.exe' 'C:\\Users\\YourName\\.codex_screen\\codex_hook_relay.py'"
 timeout = 5
 
-[[hooks.PermissionRequest]]
-
-[[hooks.PermissionRequest.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.PreToolUse]]
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.PostToolUse]]
-
-[[hooks.PostToolUse.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.PreCompact]]
-
-[[hooks.PreCompact.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.PostCompact]]
-
-[[hooks.PostCompact.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.SubagentStart]]
-
-[[hooks.SubagentStart.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.SubagentStop]]
-
-[[hooks.SubagentStop.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.Stop]]
-
-[[hooks.Stop.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
-
-[[hooks.SessionEnd]]
-
-[[hooks.SessionEnd.hooks]]
-type = "command"
-command = "~/.codex_screen/codex_hook_relay"
-commandWindows = '& "C:\Users\42194\.codex_screen\codex_hook_windows_launcher.ps1" -RelayExe "C:\Users\42194\.codex_screen\codex_hook_relay.exe"'
-timeout = 5
 # END codex-monitor-hook

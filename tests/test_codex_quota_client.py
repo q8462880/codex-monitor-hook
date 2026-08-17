@@ -1,4 +1,6 @@
 import queue
+import threading
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -141,6 +143,10 @@ class CodexQuotaClientTest(unittest.TestCase):
             quota_client,
             "CodexQuotaSession",
             return_value=fake_session,
+        ), patch.object(
+            quota_client,
+            "_codex_auth_mode",
+            return_value=None,
         ):
             quota_client._poll_quota_loop(target_queue, stop_event)
 
@@ -152,6 +158,86 @@ class CodexQuotaClientTest(unittest.TestCase):
             target_queue.get_nowait(),
         )
         fake_session.close.assert_called_once_with()
+
+    def test_quota_refresh_wait_can_be_woken_by_hook(self):
+        stop_event = threading.Event()
+        refresh_event = threading.Event()
+        refresh_event.set()
+
+        self.assertFalse(
+            quota_client._wait_for_quota_refresh_or_stop(
+                stop_event,
+                refresh_event,
+            )
+        )
+        self.assertFalse(refresh_event.is_set())
+
+    def test_api_key_auth_starts_quota_process_to_probe_compatible_accounts(self):
+        with patch.dict(
+            quota_client.os.environ,
+            {"CODEX_SCREEN_ENABLE_CODEX_QUOTA": "1"},
+        ), patch.object(
+            quota_client,
+            "_codex_auth_mode",
+            return_value="apikey",
+        ), patch.object(
+            quota_client,
+            "CodexQuotaSession",
+        ) as session:
+            thread = quota_client.start_quota_poller(
+                queue.Queue(), unittest.mock.Mock()
+            )
+
+        self.assertIsNotNone(thread)
+        session.assert_called_once_with()
+        thread.join(timeout=1)
+
+    def test_poller_notifies_daemon_when_quota_is_unavailable(self):
+        class StopAfterWait:
+            def __init__(self):
+                self.wait_calls = 0
+
+            def is_set(self):
+                return self.wait_calls > 0
+
+            def wait(self, _timeout):
+                self.wait_calls += 1
+
+        target_queue = queue.Queue()
+        fake_session = unittest.mock.Mock()
+        fake_session.fetch_state.return_value = None
+        fake_session.last_failure = "JSON-RPC -32600: account authentication required"
+
+        with patch.object(
+            quota_client,
+            "CodexQuotaSession",
+            return_value=fake_session,
+        ):
+            quota_client._poll_quota_loop(target_queue, StopAfterWait())
+
+        self.assertEqual(
+            {
+                "_internal_kind": quota_client.INTERNAL_QUOTA_UNAVAILABLE_EVENT,
+                "reason": "JSON-RPC -32600: account authentication required",
+            },
+            target_queue.get_nowait(),
+        )
+        fake_session.close.assert_called_once_with()
+
+    def test_quota_session_reconnects_when_auth_file_changes(self):
+        session = quota_client.CodexQuotaSession(timeout_sec=1)
+        session.auth_signature = "old-auth"
+        session.process = unittest.mock.Mock()
+
+        with patch.object(
+            quota_client,
+            "_auth_file_signature",
+            return_value="new-auth",
+        ), patch.object(session, "close") as close:
+            session._refresh_auth_session()
+
+        close.assert_called_once_with()
+        self.assertEqual("new-auth", session.auth_signature)
 
     def test_reader_can_discard_stderr_without_buffer_growth(self):
         lines = ["warning 1\n", "warning 2\n"]
@@ -184,6 +270,26 @@ class CodexQuotaClientTest(unittest.TestCase):
         text = format_rate_limit_text(result, now_epoch=0)
 
         self.assertEqual("Codex 42% used reset 00:30", text)
+
+    def test_accepts_response_with_only_multi_bucket_rate_limits(self):
+        result = {
+            "result": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {"usedPercent": 24},
+                    },
+                },
+            },
+        }
+
+        parsed = parse_rate_limits_result(result)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            "codex 24% used",
+            format_rate_limit_text(parsed),
+        )
 
     def test_formats_spend_control_when_window_is_missing(self):
         result = {
@@ -242,6 +348,52 @@ class CodexQuotaClientTest(unittest.TestCase):
         self.assertIsNone(parse_rate_limits_result({"error": {"message": "auth required"}}))
         self.assertIsNone(format_rate_limit_text({}, now_epoch=0))
 
+    def test_logs_chatgpt_authentication_error_instead_of_silently_dropping_it(self):
+        fake_process = unittest.mock.Mock(stdout=None, stderr=None)
+        session = quota_client.CodexQuotaSession(timeout_sec=1)
+        responses = [
+            {"id": 1, "result": {}},
+            {
+                "id": 2,
+                "error": {
+                    "code": -32600,
+                    "message": "chatgpt authentication required to read rate limits",
+                },
+            },
+        ]
+
+        with patch.object(
+            quota_client,
+            "_iter_runnable_codex_paths",
+            return_value=iter(["codex.exe"]),
+        ), patch.object(
+            quota_client,
+            "_start_app_server",
+            return_value=fake_process,
+        ), patch.object(
+            quota_client,
+            "_start_reader",
+        ), patch.object(
+            quota_client,
+            "_send",
+        ), patch.object(
+            quota_client,
+            "_read_response",
+            side_effect=responses,
+        ), patch.object(
+            quota_client,
+            "log_line",
+        ) as log:
+            self.assertIsNone(session.fetch_state())
+
+        self.assertTrue(
+            any(
+                "chatgpt authentication required" in call.args[1]
+                for call in log.call_args_list
+            )
+        )
+        session.close()
+
     def test_skips_candidate_executable_that_cannot_start(self):
         response = {
             "id": 2,
@@ -262,6 +414,54 @@ class CodexQuotaClientTest(unittest.TestCase):
                     text = fetch_codex_quota_text()
 
         self.assertEqual("codex 12% used", text)
+
+    def test_candidates_use_codex_home_environment(self):
+        with patch.dict(quota_client.os.environ, {"CODEX_HOME": "D:/custom-codex"}):
+            candidates = list(quota_client._candidate_codex_paths())
+
+            self.assertEqual(
+                Path("D:/custom-codex/.sandbox-bin/codex.exe"),
+                candidates[0],
+            )
+
+    def test_candidates_include_posix_sandbox_cli(self):
+        with patch.dict(quota_client.os.environ, {"CODEX_HOME": "/Users/test/.codex"}):
+            candidates = list(quota_client._candidate_codex_paths())
+
+        self.assertIn(
+            Path("/Users/test/.codex/.sandbox-bin/codex"),
+            candidates,
+        )
+
+    def test_candidates_include_chatgpt_macos_cli(self):
+        candidates = list(quota_client._candidate_codex_paths())
+
+        self.assertIn(
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            candidates,
+        )
+
+    def test_candidates_include_desktop_local_app_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_app_data = Path(directory)
+            desktop_exe = (
+                local_app_data
+                / "OpenAI"
+                / "Codex"
+                / "bin"
+                / "desktop-build"
+                / "codex.exe"
+            )
+            desktop_exe.parent.mkdir(parents=True)
+            desktop_exe.write_bytes(b"codex")
+
+            with patch.dict(
+                quota_client.os.environ,
+                {"LOCALAPPDATA": str(local_app_data)},
+            ):
+                candidates = list(quota_client._candidate_codex_paths())
+
+        self.assertIn(desktop_exe, candidates)
 
     def test_starts_windows_app_server_without_console_window(self):
         fake_process = object()

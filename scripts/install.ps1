@@ -1,15 +1,13 @@
-﻿param(
+param(
     [string]$TargetDir = (Join-Path $HOME ".codex_screen"),
     [string]$CodexHome = "",
-    [ValidateSet("full", "minimal")]
-    [string]$HookProfile = "full",
+    [ValidateSet("quota", "full", "minimal")]
+    [string]$HookProfile = "quota",
     [switch]$SkipConfigUpdate
 )
 
 $ErrorActionPreference = "Stop"
 
-$StartMarker = "# BEGIN codex-monitor-hook"
-$EndMarker = "# END codex-monitor-hook"
 $FullHookEvents = @(
     "SessionStart",
     "UserPromptSubmit",
@@ -23,6 +21,10 @@ $FullHookEvents = @(
     "Stop",
     "SessionEnd"
 )
+$QuotaHookEvents = @(
+    "SessionStart",
+    "UserPromptSubmit"
+)
 $MinimalHookEvents = @(
     "SessionStart",
     "UserPromptSubmit",
@@ -33,132 +35,191 @@ $MinimalHookEvents = @(
 
 function Assert-Windows {
     if ([Environment]::OSVersion.Platform -ne "Win32NT") {
-        throw "This packaged installer currently supports Windows only."
+        throw "This PowerShell installer currently supports Windows only."
     }
 }
 
-function ConvertTo-TomlString {
-    param([string]$Value)
+function Test-RealExecutablePath {
+    param([string]$Path)
 
-    if (-not $Value.Contains("'")) {
-        return "'" + $Value + "'"
+    if (-not $Path) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
     }
 
-    $Escaped = $Value.Replace("\", "\\").Replace('"', '\"')
-    return '"' + $Escaped + '"'
+    $WindowsApps = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    return -not $FullPath.StartsWith($WindowsApps, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-Python {
+    $Command = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($Command -and (Test-RealExecutablePath $Command.Source)) {
+        return $Command.Source
+    }
+
+    $Launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($Launcher -and (Test-RealExecutablePath $Launcher.Source)) {
+        Write-Warning "python.exe was not found or resolved to a WindowsApps alias; using py.exe as the installer runtime."
+        return $Launcher.Source
+    }
+
+    throw "A real Python runtime was not found. Install Python from python.org or the Python launcher, then run this installer again."
+}
+
+function Resolve-Pythonw {
+    param([string]$PythonPath)
+
+    $Sibling = Join-Path (Split-Path -Parent $PythonPath) "pythonw.exe"
+    if (Test-RealExecutablePath $Sibling) {
+        return $Sibling
+    }
+
+    $Launcher = Get-Command pyw.exe -ErrorAction SilentlyContinue
+    if ($Launcher -and (Test-RealExecutablePath $Launcher.Source)) {
+        return $Launcher.Source
+    }
+
+    $Command = Get-Command pythonw.exe -ErrorAction SilentlyContinue
+    if ($Command -and (Test-RealExecutablePath $Command.Source)) {
+        return $Command.Source
+    }
+
+    throw "pythonw.exe or pyw.exe was not found beside Python. Install a standard Windows Python distribution so hooks do not open a console window."
+}
+
+function Ensure-HidApi {
+    param([string]$PythonPath)
+
+    & $PythonPath -c "import hid" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-Host "Installing the Python hidapi package for the current user..."
+    # 限制网络重试，避免依赖源不可达时安装器长时间无输出。
+    & $PythonPath -m pip install --user hidapi --disable-pip-version-check --timeout 15 --retries 1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not install hidapi with the selected Python interpreter."
+    }
+
+    & $PythonPath -c "import hid" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "hidapi installation finished but Python still cannot import hid."
+    }
 }
 
 function Get-HookEvents {
-    if ($HookProfile -eq "minimal") {
+    param([string]$Profile)
+
+    if ($Profile -eq "quota") {
+        return $QuotaHookEvents
+    }
+    if ($Profile -eq "minimal") {
         return $MinimalHookEvents
     }
     return $FullHookEvents
 }
 
-function New-HookBlock {
+function Test-PythonHookBootstrap {
     param(
-        [string]$RelayExe,
-        [string]$Launcher
+        [string]$PythonPath
     )
 
-    # Codex Windows hook 会通过 pwsh 执行 commandWindows。
-    # 仍然保留 launcher，是为了第一时间隐藏 Codex 创建的外层控制台窗口。
-    $CommandWindows = ConvertTo-TomlString "& `"$Launcher`" -RelayExe `"$RelayExe`""
-    $Lines = New-Object System.Collections.Generic.List[string]
-    $Lines.Add($StartMarker)
-
-    foreach ($EventName in (Get-HookEvents)) {
-        $Lines.Add("")
-        $Lines.Add("[[hooks.$EventName]]")
-        $Lines.Add("")
-        $Lines.Add("[[hooks.$EventName.hooks]]")
-        $Lines.Add('type = "command"')
-        $Lines.Add('command = "~/.codex_screen/codex_hook_relay"')
-        $Lines.Add("commandWindows = $CommandWindows")
-        $Lines.Add("timeout = 5")
-    }
-
-    $Lines.Add($EndMarker)
-    return ($Lines -join "`n")
+    # Windows PowerShell 会重写 JSON 原生参数。安装阶段只验证用户 .pth
+    # 已实际导入 bootstrap；JSON-first 顺序由真实 Codex Hook 运行时验证。
+    & $PythonPath -c "import codex_hook_bootstrap; print('codex_hook_bootstrap OK')" | Out-Host
+    return $LASTEXITCODE -eq 0
 }
 
-function Backup-CodexConfig {
-    param([string]$ConfigPath)
+function Grant-CodexSandboxRuntimeAccess {
+    param([string]$Path)
 
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        return ""
+    # Hook 由 CodexSandboxUsers 的受限令牌执行。relay 需要写日志、单实例锁、
+    # 会话缓存和动态端口文件；只给 RX 会让进程在入口阶段以 code 1 退出。
+    $Account = "$env:COMPUTERNAME\CodexSandboxUsers"
+    & icacls $Path /grant "${Account}:(OI)(CI)(M)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to grant Codex hook runtime access to $Account."
     }
-
-    $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $BackupPath = "$ConfigPath.codex-monitor-hook.$Stamp.bak"
-    Copy-Item -LiteralPath $ConfigPath -Destination $BackupPath -Force
-    return $BackupPath
 }
 
-function Get-PreservedSuffix {
-    param([string]$OldBlock)
+function Stop-InstalledRuntimeProcess {
+    param(
+        [string[]]$ScriptTargets
+    )
 
-    # 老版本曾把 Codex 维护的 hooks.state 夹在标记块里。
-    # 替换 hook 时保留这些表，避免用户重新确认 hook trust。
-    $Positions = @()
-    foreach ($Marker in @("`n[hooks.state]", "`n[plugins.", "`n[features]")) {
-        $Position = $OldBlock.IndexOf($Marker)
-        if ($Position -ge 0) {
-            $Positions += $Position
+    # Python relay 和 daemon 没有固定的进程名，因此按完整命令行精确匹配。
+    # 这样不会误杀用户运行的其他 Python 程序。
+    $Processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    foreach ($Process in $Processes) {
+        if (-not $Process.CommandLine) {
+            continue
+        }
+
+        $Matched = $false
+        foreach ($Target in $ScriptTargets) {
+            if ($Process.CommandLine.IndexOf($Target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $Matched = $true
+                break
+            }
+        }
+        if (-not $Matched) {
+            continue
+        }
+
+        try {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction Stop
+            Write-Host "Stopped existing Python runtime: PID=$($Process.ProcessId)"
+        } catch {
+            Write-Warning "Failed to stop Python runtime PID=$($Process.ProcessId): $($_.Exception.Message)"
         }
     }
-    if ($Positions.Count -eq 0) {
-        return ""
-    }
-
-    $Start = ($Positions | Measure-Object -Minimum).Minimum
-    $Suffix = $OldBlock.Substring($Start).Trim()
-    return ($Suffix -replace [regex]::Escape($EndMarker) + "\s*$", "").TrimEnd()
 }
 
-function Merge-HookBlock {
+function Stop-InstalledExecutableProcess {
     param(
-        [string]$OldText,
-        [string]$Block
+        [string[]]$ExecutableTargets
     )
 
-    $Pattern = "(?s)" + [regex]::Escape($StartMarker) + ".*?" + [regex]::Escape($EndMarker)
-    $Match = [regex]::Match($OldText, $Pattern)
-    if ($Match.Success) {
-        $Replacement = $Block
-        $Suffix = Get-PreservedSuffix $Match.Value
-        if ($Suffix) {
-            $Replacement = $Replacement + "`n`n" + $Suffix
+    # 旧版本使用固定 exe 名称。按完整 exe 路径匹配，只处理本项目目录里的旧进程。
+    foreach ($Process in (Get-Process -ErrorAction SilentlyContinue)) {
+        $ProcessPath = $null
+        try {
+            $ProcessPath = $Process.Path
+        } catch {
+            continue
         }
-        return $OldText.Substring(0, $Match.Index) + $Replacement + $OldText.Substring($Match.Index + $Match.Length)
-    }
+        if (-not $ProcessPath) {
+            continue
+        }
 
-    $Prefix = $OldText.TrimEnd()
-    if ($Prefix) {
-        return $Prefix + "`n`n" + $Block
+        foreach ($Target in $ExecutableTargets) {
+            $CurrentPath = [IO.Path]::GetFullPath($ProcessPath)
+            $TargetPath = [IO.Path]::GetFullPath($Target)
+            if ($CurrentPath -ieq $TargetPath) {
+                Stop-Process -Id $Process.Id -Force -ErrorAction Stop
+                Write-Host "Stopped legacy executable: PID=$($Process.Id) Path=$Target"
+                break
+            }
+        }
     }
-    return $Block
 }
 
-function Update-CodexConfig {
+function Remove-LegacyRuntimeFiles {
     param(
-        [string]$ConfigPath,
-        [string]$RelayExe,
-        [string]$Launcher
+        [string[]]$Paths
     )
 
-    $ConfigDir = Split-Path -Parent $ConfigPath
-    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-    $BackupPath = Backup-CodexConfig $ConfigPath
-    $OldText = ""
-    if (Test-Path -LiteralPath $ConfigPath) {
-        $OldText = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+    foreach ($Path in $Paths) {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            continue
+        }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        Write-Host "Removed legacy runtime file: $Path"
     }
-
-    $Block = New-HookBlock $RelayExe $Launcher
-    $NewText = Merge-HookBlock $OldText $Block
-    Set-Content -LiteralPath $ConfigPath -Value $NewText.TrimEnd() -Encoding UTF8
-    Write-Host "BACKUP_PATH=$BackupPath"
 }
 
 function Assert-FileExists {
@@ -182,41 +243,100 @@ if (-not $CodexHome) {
     }
 }
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path -Parent $ScriptDir
-$BinDir = Join-Path $RepoRoot "bin\windows-x64"
-$RelaySource = Join-Path $BinDir "codex_hook_relay.exe"
-$DaemonSource = Join-Path $BinDir "codex_screen_daemon.exe"
-$WindowsLauncherSource = Join-Path $ScriptDir "codex_hook_windows_launcher.ps1"
-$RelayTarget = Join-Path $TargetDir "codex_hook_relay.exe"
-$DaemonTarget = Join-Path $TargetDir "codex_screen_daemon.exe"
-$WindowsLauncherTarget = Join-Path $TargetDir "codex_hook_windows_launcher.ps1"
-$ConfigPath = Join-Path $CodexHome "config.toml"
+$PythonPath = Resolve-Python
+$PythonwPath = Resolve-Pythonw $PythonPath
+Ensure-HidApi $PythonPath
 
-Assert-FileExists $RelaySource "Missing packaged relay exe: $RelaySource"
-Assert-FileExists $DaemonSource "Missing packaged daemon exe: $DaemonSource"
-Assert-FileExists $WindowsLauncherSource "Missing Windows hook launcher: $WindowsLauncherSource"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigPath = Join-Path $CodexHome "config.toml"
+$RelaySource = Join-Path $ScriptDir "codex_hook_relay.py"
+$DaemonSource = Join-Path $ScriptDir "codex_screen_daemon.py"
+$UpdateConfigSource = Join-Path $ScriptDir "update_codex_config.py"
+$BootstrapInstallerSource = Join-Path $ScriptDir "install_python_hook_bootstrap.py"
+$RelayTarget = Join-Path $TargetDir "codex_hook_relay.py"
+$DaemonTarget = Join-Path $TargetDir "codex_screen_daemon.py"
+$UpdateConfigTarget = Join-Path $TargetDir "update_codex_config.py"
+$BootstrapInstallerTarget = Join-Path $TargetDir "install_python_hook_bootstrap.py"
+$CommandLauncherTarget = Join-Path $TargetDir "codex_hook_relay.cmd"
+$RelayExecutableTarget = Join-Path $TargetDir "codex_hook_relay.exe"
+$DaemonExecutableTarget = Join-Path $TargetDir "codex_screen_daemon.exe"
+$LegacyLauncher = Join-Path $TargetDir "codex_hook_windows_launcher.ps1"
+
+Assert-FileExists $RelaySource "Missing Python relay script: $RelaySource"
+Assert-FileExists $DaemonSource "Missing Python daemon script: $DaemonSource"
+Assert-FileExists $UpdateConfigSource "Missing config updater script: $UpdateConfigSource"
+Assert-FileExists $BootstrapInstallerSource "Missing Python Hook bootstrap installer: $BootstrapInstallerSource"
 
 New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-Copy-Item -LiteralPath $RelaySource -Destination $RelayTarget -Force
-Copy-Item -LiteralPath $DaemonSource -Destination $DaemonTarget -Force
-Copy-Item -LiteralPath $WindowsLauncherSource -Destination $WindowsLauncherTarget -Force
+Grant-CodexSandboxRuntimeAccess $TargetDir
+Stop-InstalledExecutableProcess @($RelayExecutableTarget, $DaemonExecutableTarget)
+Remove-LegacyRuntimeFiles @($LegacyLauncher, $CommandLauncherTarget, $RelayExecutableTarget, $DaemonExecutableTarget)
 
-& $DaemonTarget --self-test | Out-Host
-if (-not $?) {
-    throw "Daemon self-test failed."
+# relay 和 daemon 会导入同目录下的多个 Python 模块，统一复制整个 scripts 目录
+# 中的 .py 文件，避免只复制入口文件后在用户电脑上出现隐蔽的导入错误。
+Get-ChildItem -LiteralPath $ScriptDir -Filter "*.py" -File |
+    Copy-Item -Destination $TargetDir -Force
+
+# Python 在尝试打开命令行脚本前会加载用户 site-packages。这个条件化
+# bootstrap 仅处理 Codex 注入的 Hook JSON，普通 Python 进程不会受影响。
+& $PythonPath $BootstrapInstallerTarget $TargetDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install the Python Hook bootstrap."
+}
+
+# 使用与 Windows runner 相同的“JSON 在脚本前”顺序验证用户 site 的 .pth
+# 已被当前 Python 实际加载。dry-run 不会打开 HID、写日志或拉起 daemon。
+$PreviousBootstrapDryRun = $env:CODEX_HOOK_BOOTSTRAP_DRY_RUN
+try {
+    $env:CODEX_HOOK_BOOTSTRAP_DRY_RUN = "1"
+    if (-not (Test-PythonHookBootstrap $PythonPath)) {
+        throw "Python Hook bootstrap validation failed."
+    }
+} finally {
+    $env:CODEX_HOOK_BOOTSTRAP_DRY_RUN = $PreviousBootstrapDryRun
+}
+
+& $PythonPath $DaemonTarget --self-test | Out-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Python daemon self-test failed."
 }
 
 if (-not $SkipConfigUpdate) {
-    Update-CodexConfig $ConfigPath $RelayTarget $WindowsLauncherTarget
+    & $PythonPath $UpdateConfigTarget `
+        $ConfigPath `
+        $PythonwPath `
+        $RelayTarget `
+        $HookProfile | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to update Codex config.toml."
+    }
+
+    # 通过 Codex 自己的 hooks/list 接口检查 Hook 是否已加载和信任。
+    $OldCodexHome = $env:CODEX_HOME
+    try {
+        $env:CODEX_HOME = $CodexHome
+        & $PythonPath $DaemonTarget `
+            --diagnose-hooks (Split-Path -Parent $ScriptDir) `
+            --expected-hook-count (Get-HookEvents $HookProfile).Count `
+            --hook-diagnostic-timeout 3 | Out-Host
+        $HookDiagnosticExit = $LASTEXITCODE
+    } finally {
+        $env:CODEX_HOME = $OldCodexHome
+    }
+    if ($HookDiagnosticExit -ne 0) {
+        Write-Warning "Codex hooks are installed but not executable yet. Restart Codex, open Settings > Hooks, then review and trust the installed hooks."
+    }
 }
 
-Write-Host "Installed Codex screen hook files to $TargetDir"
+# 只有所有校验和配置写入成功后才停止旧 daemon，失败时保留可用旧实例。
+Stop-InstalledRuntimeProcess @($RelayTarget, $DaemonTarget)
+
+Write-Host "Installed Codex screen hook runtime files to $TargetDir"
+Write-Host "Python interpreter: $PythonPath"
+Write-Host "Hook Python interpreter: $PythonwPath"
 if ($SkipConfigUpdate) {
     Write-Host "Skipped Codex config.toml update."
 } else {
     Write-Host "Updated Codex config.toml at $ConfigPath"
     Write-Host "Installed hook profile: $HookProfile"
 }
-
-

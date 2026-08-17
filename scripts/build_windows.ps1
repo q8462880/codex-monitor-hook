@@ -14,7 +14,8 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 New-Item -ItemType Directory -Force -Path $SpecDir | Out-Null
 
-# 这个脚本只给维护者发布前使用；普通用户安装包里已经带 exe，不需要 Python。
+# 打包产物仅用于手工分发或诊断；默认安装链路使用已有 pythonw.exe 和
+# Python 脚本，不把这里生成的 exe 写入 Codex Hook 配置。
 & $Python -m PyInstaller --version
 if (-not $?) {
     throw "PyInstaller is not installed. Run: $Python -m pip install pyinstaller"
@@ -27,6 +28,8 @@ if (-not $?) {
     --name codex_hook_relay `
     --paths $ScriptDir `
     --hidden-import codex_screen_log `
+    --hidden-import codex_relay_state `
+    --hidden-import codex_runtime_config `
     --distpath $BinDir `
     --workpath (Join-Path $BuildDir "relay") `
     --specpath $SpecDir `
@@ -45,6 +48,8 @@ if (-not $?) {
     --hidden-import codex_screen_log `
     --hidden-import codex_state_manager `
     --hidden-import codex_quota_client `
+    --hidden-import codex_hook_diagnostics `
+    --hidden-import codex_runtime_config `
     --distpath $BinDir `
     --workpath (Join-Path $BuildDir "daemon") `
     --specpath $SpecDir `

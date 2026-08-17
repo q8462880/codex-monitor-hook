@@ -1,43 +1,65 @@
 ---
 name: codex-monitor-hook
-description: Deploy and maintain a local Codex hook relay plus packaged HID daemon for showing Codex session state and quota text on a custom HID screen. Use when installing, updating, or troubleshooting the codex-monitor-hook project, ~/.codex_screen files, localhost:12688 relay, packaged executables, or Codex hook configuration.
+description: Deploy and maintain a local Codex hook relay plus Python HID daemon for showing Codex session state and quota text on a custom HID screen. Use when installing, updating, or troubleshooting the codex-monitor-hook project, ~/.codex_screen files, localhost TCP relay, Python runtime, or Codex hook configuration.
 ---
 
 # Codex Monitor Hook
 
 ## Project Layout
 
-- `scripts/codex_hook_relay.py`: Codex hook relay. It only reads hook stdin and forwards JSON to `127.0.0.1:12688`; it must not import or touch USB/HID APIs.
-- `scripts/codex_screen_daemon.py`: Long-running local daemon. It owns the HID device, listens on TCP, reconnects on USB unplug/replug, serializes messages through a queue, and exits after idle timeout.
+- `scripts/codex_hook_relay.py`: Codex hook relay. It only reads hook stdin and forwards JSON to the daemon's negotiated localhost TCP port; it must not import or touch USB/HID APIs.
+- `scripts/codex_screen_daemon.py`: Long-running local daemon script. It owns the HID device, listens on TCP, reconnects on USB unplug/replug, serializes messages through a queue, and exits after idle timeout.
 - `scripts/codex_quota_client.py`: Optional Codex app-server quota reader. It keeps one hidden stdio app-server connection for the daemon lifetime, reuses it for refreshes, and reconnects after a timeout or process exit; failures fall back silently.
 - `scripts/codex_screen_log.py`: Shared file logger. It writes short lifecycle logs to `~/.codex_screen/codex_screen.log` without recording full prompts.
 - `scripts/update_codex_config.py`: Installer helper that backs up `config.toml`, installs the hook marker block, and validates TOML syntax.
-- `scripts/install.ps1`: Windows-friendly installer that copies packaged exe files, backs up Codex `config.toml`, and installs hook config.
-- `bin/windows-x64/`: Windows user-facing executables copied by the installer.
+- `scripts/install.ps1`: Windows installer that copies Python scripts, checks `pythonw.exe` and `hidapi`, backs up Codex `config.toml`, and installs Windows Hook config.
+- `scripts/install.sh`: macOS/POSIX installer that uses `python3`, installs `hidapi`, backs up Codex `config.toml`, and installs a POSIX Hook command.
+- `requirements.txt`: Python runtime dependency list; currently only `hidapi`.
 - `references/codex_config_hooks.toml`: Hook snippet that can be appended to Codex `config.toml` after installation.
 
 ## Required Architecture
 
 Keep this architecture unchanged unless the user explicitly changes it:
 
-`Codex Hook -> codex_hook_relay.exe -> 127.0.0.1:12688 TCP -> codex_screen_daemon.exe -> HID device`
+`Codex Hook -> pythonw.exe codex_hook_relay.py -> localhost negotiated TCP port -> pythonw.exe codex_screen_daemon.py -> HID device`
 
 Rules:
 
 - The hook relay only performs local socket forwarding and daemon spawn/retry.
 - Inline hooks must use `[[hooks.Event]]` plus `[[hooks.Event.hooks]]`; the command handler uses string `command` and `commandWindows` values. Keep hooks synchronous and let the relay return quickly after socket forwarding/spawn.
 - The daemon is the only process allowed to open the HID device.
-- The daemon exits immediately when the port is already occupied, providing single-instance protection.
+- `12688` is the preferred port. If Windows reserves it or another program uses it, the daemon tries fallback ports and finally asks the OS for a temporary port.
+- The daemon writes the selected port to `~/.codex_screen/runtime.json`; relay reads that file before connecting.
+- The daemon exits when its instance lock is unavailable or all port candidates fail, providing single-instance protection.
 - Hardware constants stay in the daemon configuration block near the top of the file.
 - `HID_PROTOCOL_READY` is `True`; the daemon writes the firmware `0x24/0x01` binary Codex Monitor state frame and still processes hook events when the HID device is temporarily disconnected.
-- Hook status events include `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `Stop`, and `SessionEnd`.
+- HID state frames set `flags.bit0` (`STATUS_VALID`). Five-second link heartbeats clear this bit and use invalid status/quota fields, so firmware must refresh only its offline timer without treating `THINKING` or another business state as a repeated event.
+- The default quota profile registers `SessionStart`, `UserPromptSubmit`, and `SessionEnd`.
+  The full list of legacy status events remains available through `-HookProfile full`.
+- In quota mode, relay sends an internal throttled quota-refresh request and does not cache
+  or forward session/turn status signals. The old status path is retained but disabled by default.
+  Set `CODEX_SCREEN_ENABLE_STATUS_HOOKS=1` before installing `-HookProfile full` to restore it.
+- Relay keeps one bounded cache per `session_id`. `SessionStart`, PID, timestamps,
+  and background tool events never select a session. Until a desktop bridge exists,
+  a successful `UserPromptSubmit` is treated as the user's latest action and sets
+  that event's `session_id` as `active_session_id`; this makes normal single-window
+  use work without guessing from background activity.
+- Use `--set-active-session <session_id>` for a future desktop bridge or test tool,
+  `--show-active-session` to inspect the current selection, and
+  `--clear-active-session` to stop forwarding until another user prompt or explicit
+  selection arrives.
+- The legacy `Stop` and `SessionEnd` behavior remains in the full status profile only.
 - The daemon uses `scripts/codex_state_manager.py` to track session and turn lifecycles.
   `UserPromptSubmit` starts a turn, tool/permission/compaction/subagent hooks update the
   turn's detailed state, matching `Stop` ends only that turn, and `SessionEnd` ends the
   whole session. Stale events from another session or an already stopped turn are ignored.
-- Ordinary Windows users do not install Python, `pip`, or `hidapi`; those are bundled into the packaged executables.
-- Source development still uses standard Python plus `hidapi` only.
-- Real quota lookup is optional. It requires a Codex app-server auth mode that can read `account/rateLimits/read`; API-key-only auth may return `chatgpt authentication required`.
+- Windows users need an existing standard Python installation; macOS users need `python3`. The Windows installer uses its
+  `pythonw.exe` and automatically installs the single `hidapi` package if it is missing.
+- The Hook command never calls PowerShell or a `.ps1` launcher. `pythonw.exe` is used so
+  the Hook process and the background daemon do not create a console window.
+- Real quota lookup is optional. The daemon always probes `account/rateLimits/read` regardless of local auth mode, because compatible or managed sign-in modes can differ. If the service rejects the request, it hides the device quota fields and records the short reason in the local log.
+- Official ChatGPT login is read from the same `CODEX_HOME` and is queried through one reused hidden app-server connection. API-key-only auth may return `chatgpt authentication required` and will then leave quota values hidden.
+- A change to `auth.json` closes the reused app-server session before the next query, so account switchers can refresh the quota without a machine restart. `SessionEnd` also closes the daemon cleanly when Codex exits normally.
 
 ## Deployment Workflow
 
@@ -47,7 +69,7 @@ For a Superpowers-style remote install prompt, publish this repository on GitHub
 Fetch and follow instructions from https://raw.githubusercontent.com/q8462880/codex-monitor-hook/refs/heads/master/.codex/INSTALL.md
 ```
 
-1. Copy packaged runtime files and install hooks:
+1. Copy Python runtime files and install hooks:
 
    ```powershell
    .\scripts\install.ps1
@@ -58,7 +80,7 @@ Fetch and follow instructions from https://raw.githubusercontent.com/q8462880/co
 2. Verify the install:
 
    ```powershell
-   & $HOME\.codex_screen\codex_screen_daemon.exe --self-test
+   & python $HOME\.codex_screen\codex_screen_daemon.py --self-test
    ```
 
 ## Quota Display
@@ -75,14 +97,23 @@ Later refreshes reuse the same process instead of repeatedly creating and closin
 process exit closes the broken connection, and the next refresh reconnects. When the screen daemon
 stops, it waits for the quota thread to close the app-server child.
 
+Quota failures are recorded in `~/.codex_screen/codex_screen.log` with a `[quota]` prefix. The
+daemon returns any stale display state to `READY` after 2 minutes without a new hook event. Set
+`CODEX_SCREEN_HOOK_STALE_TIMEOUT_SEC=0` to disable that fallback.
+
+The relay cache is bounded to 32 sessions. The log rotates at 1 MiB and keeps two backups.
+
 ## Installer Options
 
 - `.\scripts\install.ps1 -SkipConfigUpdate`: copy runtime files without changing Codex `config.toml`.
-- `.\scripts\install.ps1 -HookProfile minimal`: install only `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop`, and `SessionEnd`; this reduces Windows PowerShell hook launches when performance matters.
+- `.\scripts\install.ps1 -HookProfile quota`: default; install `SessionStart`, `UserPromptSubmit`, and `SessionEnd` for quota refresh and clean shutdown.
+- `.\scripts\install.ps1 -HookProfile full`: restore all legacy status hooks.
+- `.\scripts\install.ps1 -HookProfile minimal`: retain the previous reduced status profile for compatibility.
 - `.\scripts\install.ps1 -CodexHome D:\tmp\codex-home`: write config under a custom Codex home, useful for testing.
 
-On Windows the installer writes a hidden-console launcher plus `codex_hook_relay.exe` in `commandWindows`. The launcher hides the
-PowerShell console created by Codex before forwarding stdin to the relay exe.
+On Windows the installer writes a direct `pythonw.exe "<path>\codex_hook_relay.py"`
+commandWindows entry. It does not install or invoke the old PowerShell launcher or
+packaged exe runtime.
 
 ## Runtime Logs and Hook Smoke Test
 
@@ -96,7 +127,7 @@ Use this local smoke test to confirm relay -> daemon works before testing a real
 
 ```powershell
 Remove-Item $HOME\.codex_screen\codex_screen.log -ErrorAction SilentlyContinue
-'{"hook_event_name":"SessionStart","session_id":"manual-test"}' | & $HOME\.codex_screen\codex_hook_relay.exe
+'{"hook_event_name":"SessionStart","session_id":"manual-test"}' | & python $HOME\.codex_screen\codex_hook_relay.py
 Get-Content $HOME\.codex_screen\codex_screen.log -Tail 80
 ```
 
@@ -108,10 +139,23 @@ When testing real Codex hooks, keep the log open:
 Get-Content $HOME\.codex_screen\codex_screen.log -Wait -Tail 80
 ```
 
+Check whether Codex loaded, enabled, and trusted the hooks:
+
+```powershell
+& python $HOME\.codex_screen\codex_screen_daemon.py --diagnose-hooks $PWD --expected-hook-count 2
+```
+
+The expected quota-profile result is `loaded=3 executable=3`; full-profile remains
+`loaded=11 executable=11`. Visible hooks marked `untrusted`
+or `modified` are not executable until the user reviews and trusts them in Settings > Hooks.
+
 ## Firmware Protocol Note
 
-The daemon writes a 1024-byte firmware payload beginning with `0x24, 0x01, 0x01`
-for Codex Monitor state. `hidapi.write()` receives one leading `report_id=0`
-byte, so the actual host write is 1025 bytes while the USB Output Report remains
-1024 bytes. The payload contains status, icon code, current/weekly usage
-percentages and reset seconds; the firmware renders the status icon animation.
+The daemon opens the Codex Micro-compatible device at `VID=0x303A`, `PID=0x8360`,
+selecting the daemon-only vendor-defined collection `usage_page=0xFF01`, `usage=0x01`
+(the daemon-only `MI_02` interface). The collection is Output-only and uses
+Report ID `0x07`: `hidapi.write()` receives 1024 bytes total, with `0x07` as the
+first byte and the first 1023 bytes of the firmware's 1024-byte Monitor payload
+following it. The payload begins with `0x24, 0x01, 0x01` and contains status, icon
+code, current/weekly usage percentages and reset seconds; the firmware restores
+the final missing byte as zero before parsing.

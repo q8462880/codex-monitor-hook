@@ -1,4 +1,7 @@
 # OpenAI Codex CLI Hook 事件清单
+
+> 当前默认安装为额度模式，只注册 `SessionStart` 和 `UserPromptSubmit` 来启动 daemon
+> 并请求额度刷新。下文的状态映射属于保留的 legacy `full` profile，不会默认发送到 HID。
 ## 事件对照表
 | Hook 事件 | 触发时机（用户视角） | 常用用途 |
 | ---- | ---- | ---- |
@@ -35,6 +38,37 @@ SessionStart 【开启对话】
 - `Stop`：只结束匹配 `session_id + turn_id` 的一轮问答，屏幕回到 `IDLE`，session 本身仍然存在。
 - `SessionEnd`：结束整个 session。旧 session 或旧 turn 的迟到事件不会覆盖当前屏幕状态。
 
+## 并发对话显示规则
+
+- relay 为每个 `session_id` 保存独立缓存；`turn_id` 和 `tool_use_id` 只在所属
+  session 内校验，不能跨 session 判断归属。
+- 普通 `SessionStart`、后台工具事件和最新到达事件都不会自动成为桌面当前对话。
+- 当前阶段把成功的 `UserPromptSubmit` 视为“用户最后一次明确操作”，自动把它的
+  `session_id` 填入 `active_session_id`：
+
+  ```text
+  UserPromptSubmit(session_id=A)
+    -> active_session_id=A
+    -> A 后续状态允许发送到 HID
+  ```
+
+- 如果需要桌面桥接或手工切换，仍可以使用独立输入接口：
+
+  ```powershell
+  & python $HOME\.codex_screen\codex_hook_relay.py --set-active-session <session_id>
+  & python $HOME\.codex_screen\codex_hook_relay.py --show-active-session
+  & python $HOME\.codex_screen\codex_hook_relay.py --clear-active-session
+  ```
+
+- 切换时 relay 会用目标 session 的缓存重放既有 Hook 事件；没有缓存时不伪造
+  后台状态，并记录 `UNKNOWN`。
+- Codex Hook 没有可靠的桌面“当前选中对话”事件，因此这个方案只能把
+  `UserPromptSubmit` 当作用户动作信号。用户只切换对话但不提交提示词时，
+  relay 无法知道当前选中项，只能继续显示上一次已选 session 的状态。
+- `Stop` Hook 可以监听用户停止，但当前 daemon 契约把它显示为 `IDLE`；`READY`
+  仍由无新 Hook 的超时机制产生。要实现“Stop 后立即 READY”需要额外修改 daemon
+  的状态事件处理，不在本次 relay-only 改动范围内。
+
 ## Hook 到屏幕状态映射
 
 Codex Monitor 当前由 `scripts/codex_state_manager.py` 按
@@ -54,6 +88,16 @@ Codex Monitor 当前由 `scripts/codex_state_manager.py` 按
 | `SubagentStop` | 恢复子任务前状态 | 子任务结束，恢复进入子任务前的状态 |
 | `Stop` | `IDLE` | 当前 `session_id + turn_id` 的一轮问答完成 |
 | `SessionEnd` | `IDLE` | 整个 session 关闭 |
+| 2 分钟无新 Hook | `READY` | 缺失后续事件时回到初始页面 |
+
+## 数据保留策略
+
+- `~/.codex_screen/codex_screen.log` 超过 1 MiB 后轮转为 `.1`、`.2`，
+  更旧日志自动删除。
+- `codex_relay_state.json` 最多保留 32 个 session；每个 session 最多保留
+  64 个去重 key 和 32 个已结束 turn，避免并发对话长期增长。
+- 缓存只保存状态和短 ID，不保存完整 prompt；事件去重使用哈希，不把事件正文写入
+  持久化文件。
 
 ### 当前状态集合
 
@@ -68,6 +112,7 @@ Codex Monitor 当前由 `scripts/codex_state_manager.py` 按
 | `WAIT_PERM` | `0x03` | `Waiting` | 是 |
 | `COMPACTING` | `0x04` | `Compacting` | 是 |
 | `SUBAGENT` | `0x05` | `Subagent` | 是 |
+| `READY` | `0x06` | `Ready` | 否 |
 | `OFFLINE` | `0xE0` | `Offline` | 否 |
 | `ERROR` | `0xE1` | `Check Codex` | 否 |
 
