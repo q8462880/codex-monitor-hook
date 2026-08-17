@@ -19,6 +19,13 @@ class InstallScriptTests(unittest.TestCase):
 
         self.assertIn("export CODEX_HOME", text)
 
+    def test_posix_installer_creates_private_quota_auth_home(self) -> None:
+        text = POSIX_INSTALL_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("QUOTA_AUTH_DIR=${CODEX_SCREEN_QUOTA_AUTH_DIR", text)
+        self.assertIn('mkdir -p "$CODEX_HOME" "$TARGET_DIR" "$QUOTA_AUTH_DIR"', text)
+        self.assertIn('chmod 700 "$QUOTA_AUTH_DIR"', text)
+
     def test_posix_installer_uses_profile_specific_hook_count(self) -> None:
         text = POSIX_INSTALL_SCRIPT.read_text(encoding="utf-8")
 

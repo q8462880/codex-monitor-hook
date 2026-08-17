@@ -49,6 +49,15 @@ HID_VENDOR_ID = 0x303A
 HID_PRODUCT_ID = 0x8360
 HID_USAGE_PAGE = 0xFF01
 HID_USAGE = 0x01
+# macOS 的 hidapi 会把同一固件 collection 枚举为 FF00/0x61；这是
+# 当前 Codex Micro 在 macOS 上实际暴露的 daemon 输出接口。两组值都必须
+# 显式匹配，不能在找不到目标时回退到 devices[0]，否则可能误打开键盘接口。
+HID_MACOS_USAGE_PAGE = 0xFF00
+HID_MACOS_USAGE = 0x61
+HID_COLLECTION_CANDIDATES = (
+    (HID_USAGE_PAGE, HID_USAGE),
+    (HID_MACOS_USAGE_PAGE, HID_MACOS_USAGE),
+)
 # Monitor 业务帧仍为 1024 字节；HID Report ID 复用其中 1 字节，
 # 所以实际 hidapi.write() 总长度也是 1024，而不是旧协议的 1025。
 HID_REPORT_SIZE = 1024
@@ -303,14 +312,17 @@ class CodexScreenDaemon:
         self.last_frame: Optional[bytes] = None
         self.last_frame_written_at = 0.0
         self.lock = threading.Lock()
-        self.last_hid_open_log_at = 0.0
-        self.last_hid_unavailable_log_at = 0.0
-        self.last_hid_failure_log_at = 0.0
+        # 负值保证 daemon 刚启动时首条设备状态也会记录；不能用 0，
+        # 否则系统启动后的前 60 秒会把首次故障/打开日志错误地限掉。
+        self.last_hid_open_log_at = -HID_FAILURE_LOG_INTERVAL_SEC
+        self.last_hid_unavailable_log_at = -HID_FAILURE_LOG_INTERVAL_SEC
+        self.last_hid_failure_log_at = -HID_FAILURE_LOG_INTERVAL_SEC
         self.hid_failure_count = 0
         self.hid_disabled_logged = False
         self.quota_thread: Optional[threading.Thread] = None
         self.quota_refresh_event = threading.Event()
-        self.last_quota_refresh_requested_at = 0.0
+        # 首次 UserPromptSubmit 必须立即唤醒额度线程，之后再按 15 秒限频。
+        self.last_quota_refresh_requested_at = -QUOTA_REFRESH_MIN_INTERVAL_SEC
         self.turn_timeout_pending = False
         self.listen_port = PORT
 
@@ -508,7 +520,14 @@ class CodexScreenDaemon:
             self.state["quota_text"] = _short(event.get("quota_text"), 96)
             self.state["updated_at"] = time.time()
             self._advance_frame_seq()
-            log_line("daemon", f"quota updated: {self.state['quota_text']}")
+            fields = self._frame_business_fields(heartbeat=False)
+            log_line(
+                "daemon",
+                f"quota updated: {self.state['quota_text']}"
+                f" current={fields['current_percent']}"
+                f" weekly={fields['weekly_percent']}"
+                f" flags=0x{fields['flags']:02X}",
+            )
             return
 
         if event.get("_internal_kind") == INTERNAL_QUOTA_UNAVAILABLE_EVENT:
@@ -586,6 +605,18 @@ class CodexScreenDaemon:
             if key not in source:
                 continue
             value = source[key]
+            # quota client 用 0xFF / 0xFFFFFFFF 表示服务端没有返回该窗口。
+            # 这些值不能再经过常规归一化：255 会被截成 100，0xFFFFFFFF 会
+            # 被误当成 Unix 时间戳，导致固件收到虚假的“周额度有效”信号。
+            if (
+                "percent" in key
+                and value == SCREEN_HID_CODEX_PERCENT_INVALID
+            ) or (
+                "reset" in key
+                and value == SCREEN_HID_CODEX_RESET_INVALID
+            ):
+                self.state[state_key] = value
+                continue
             self.state[state_key] = (
                 _normalize_percent(value)
                 if "percent" in key
@@ -645,7 +676,15 @@ class CodexScreenDaemon:
             return False
         info = self._pick_device(devices)
         if info is None:
-            self._log_hid_unavailable("HID device has no selectable collection")
+            available = ",".join(
+                f"0x{int(item.get('usage_page') or 0):04X}/"
+                f"0x{int(item.get('usage') or 0):02X}"
+                for item in devices
+            )
+            self._log_hid_unavailable(
+                "HID monitor collection not found; "
+                f"available={available or '-'}"
+            )
             return False
         dev = hid.device()
         try:
@@ -665,7 +704,9 @@ class CodexScreenDaemon:
             log_line(
                 "daemon",
                 f"HID opened vid=0x{HID_VENDOR_ID:04X} pid=0x{HID_PRODUCT_ID:04X}"
-                f" usage=0x{HID_USAGE_PAGE:04X}/0x{HID_USAGE:02X}",
+                f" usage=0x{int(info.get('usage_page') or 0):04X}/"
+                f"0x{int(info.get('usage') or 0):02X}"
+                f" interface={info.get('interface_number', '-')}",
             )
             self.last_hid_open_log_at = now
         return True
@@ -680,10 +721,14 @@ class CodexScreenDaemon:
         self.last_hid_unavailable_log_at = now
 
     def _pick_device(self, devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        for info in devices:
-            if int(info.get("usage_page") or 0) == HID_USAGE_PAGE and int(info.get("usage") or 0) == HID_USAGE:
-                return info
-        return devices[0] if devices else None
+        for usage_page, usage in HID_COLLECTION_CANDIDATES:
+            for info in devices:
+                if (
+                    int(info.get("usage_page") or 0) == usage_page
+                    and int(info.get("usage") or 0) == usage
+                ):
+                    return info
+        return None
 
     def _close_device(self) -> None:
         with self.lock:

@@ -2,7 +2,7 @@ import io
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PosixPath
 from unittest.mock import patch
 
 
@@ -48,7 +48,9 @@ class CodexHookRelayTest(unittest.TestCase):
 
             with patch.object(relay.os, "name", "nt"), patch.object(
                 relay, "DAEMON_SCRIPT", daemon_script
-            ), patch.object(relay.sys, "executable", str(python_exe)):
+            ), patch.object(relay.sys, "executable", str(python_exe)), patch.object(
+                relay, "Path", PosixPath
+            ):
                 self.assertEqual(
                     [str(pythonw_exe), str(daemon_script), "--daemon"],
                     relay._daemon_command(),

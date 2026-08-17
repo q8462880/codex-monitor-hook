@@ -58,7 +58,12 @@ Rules:
 - The Hook command never calls PowerShell or a `.ps1` launcher. `pythonw.exe` is used so
   the Hook process and the background daemon do not create a console window.
 - Real quota lookup is optional. The daemon always probes `account/rateLimits/read` regardless of local auth mode, because compatible or managed sign-in modes can differ. If the service rejects the request, it hides the device quota fields and records the short reason in the local log.
-- Official ChatGPT login is read from the same `CODEX_HOME` and is queried through one reused hidden app-server connection. API-key-only auth may return `chatgpt authentication required` and will then leave quota values hidden.
+- Official ChatGPT login is queried through one reused hidden app-server connection. On macOS,
+  when `~/.codex_screen/quota-codex-home/auth.json` exists, the quota reader uses that isolated
+  `CODEX_HOME` so a desktop API-key login cannot overwrite it; a valid ChatGPT login written to
+  the main auth file is synchronized on refresh. Windows preserves its normal main `CODEX_HOME`
+  behavior unless `CODEX_SCREEN_QUOTA_CODEX_HOME` is explicitly set. API-key-only auth may return
+  `chatgpt authentication required` and will then leave quota values hidden.
 - A change to `auth.json` closes the reused app-server session before the next query, so account switchers can refresh the quota without a machine restart. `SessionEnd` also closes the daemon cleanly when Codex exits normally.
 
 ## Deployment Workflow
@@ -91,6 +96,7 @@ The daemon tries to refresh Codex quota text every 180 seconds. Set these enviro
 - `CODEX_SCREEN_QUOTA_REFRESH_SEC=60`: change refresh interval.
 - `CODEX_SCREEN_CODEX_EXE=C:\path\to\codex.exe`: force a specific Codex executable.
 - `CODEX_SCREEN_QUOTA_TEXT="quota: --"`: fallback text when app-server quota lookup is unavailable.
+- `CODEX_SCREEN_QUOTA_CODEX_HOME=/path/to/home`: override the isolated quota auth directory.
 
 The quota reader starts one hidden `codex.exe app-server --stdio` when the first refresh is needed.
 Later refreshes reuse the same process instead of repeatedly creating and closing it. A timeout or

@@ -147,13 +147,21 @@ tail -n 80 "$HOME/.codex_screen/codex_screen.log"
 ## Quota Login Requirements
 
 - API key login (`auth_mode = "apikey"`) can run Codex，但不一定具备 ChatGPT 账户额度权限。daemon 会实际请求一次额度接口；服务端拒绝时设备会隐藏额度区域并保持在线，具体原因记录在日志中。
+- On macOS, when the desktop client uses an API key or a third-party endpoint, keep the ChatGPT
+  quota credential in `~/.codex_screen/quota-codex-home/auth.json` with owner-only permissions.
+  The monitor uses this isolated directory only for its private app-server, so desktop login
+  updates cannot overwrite the quota credential. A valid ChatGPT login later written to the main
+  `~/.codex/auth.json` is synchronized automatically on the next quota refresh. Windows keeps
+  its existing main `CODEX_HOME` behavior unless `CODEX_SCREEN_QUOTA_CODEX_HOME` is explicitly set.
 - Official ChatGPT account login must be completed with Codex login. Verify it with:
 
   ```powershell
   & $HOME\.codex\.sandbox-bin\codex.exe login status
   ```
 
-  The daemon inherits `CODEX_HOME`, so a custom Codex home uses the same official account credentials. After login, restart Codex so the next daemon instance refreshes the quota.
+  On macOS, the daemon passes the isolated quota home to its private app-server when the file
+  above exists. Set `CODEX_SCREEN_QUOTA_CODEX_HOME` only when a different isolated home is
+  required. After login, restart Codex so the next daemon instance refreshes the quota.
 - Quota diagnostics are in `~/.codex_screen/codex_screen.log`, using `[quota]` lines. The expected successful line contains `quota available via`; authentication failures include the app-server error returned by `account/rateLimits/read`.
 
 The daemon returns any displayed state to `READY` after 2 minutes without a new hook event. Set `CODEX_SCREEN_HOOK_STALE_TIMEOUT_SEC=0` to disable this fallback.

@@ -7,6 +7,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
 CODEX_HOME=${CODEX_HOME:-"$HOME/.codex"}
 TARGET_DIR=${CODEX_SCREEN_TARGET_DIR:-"$HOME/.codex_screen"}
+QUOTA_AUTH_DIR=${CODEX_SCREEN_QUOTA_AUTH_DIR:-"$TARGET_DIR/quota-codex-home"}
 HOOK_PROFILE=${CODEX_SCREEN_HOOK_PROFILE:-quota}
 SKIP_CONFIG_UPDATE=0
 SKIP_HOOK_DIAGNOSTIC=0
@@ -29,7 +30,8 @@ verify_hook_block() {
     actual_count=$(awk '
         /^# BEGIN codex-monitor-hook$/ { inside_block=1; next }
         /^# END codex-monitor-hook$/ { inside_block=0 }
-        inside_block && /^\[\[hooks\./ { hook_count++ }
+        # 每个事件包含一层 Event 和一层 Event.hooks；只统计外层事件。
+        inside_block && /^\[\[hooks\.[^.]+\]\]$/ { hook_count++ }
         END { print hook_count + 0 }
     ' "$CODEX_HOME/config.toml")
     if [ "$actual_count" -ne "$expected_count" ]; then
@@ -118,7 +120,8 @@ fi
 }
 log_elapsed "Python dependency check"
 
-mkdir -p "$CODEX_HOME" "$TARGET_DIR" "$HOME/.codex/skills/codex-monitor-hook"
+mkdir -p "$CODEX_HOME" "$TARGET_DIR" "$QUOTA_AUTH_DIR" "$HOME/.codex/skills/codex-monitor-hook"
+chmod 700 "$QUOTA_AUTH_DIR"
 STAMP=$(date +%Y%m%d-%H%M%S)
 PACKAGE_TARGET="$HOME/.codex/codex-monitor-hook"
 if [ "$REPO_ROOT" != "$PACKAGE_TARGET" ] && [ -e "$PACKAGE_TARGET" ]; then
@@ -161,5 +164,6 @@ fi
 printf '%s\n' "Installed Codex Monitor Hook for macOS."
 printf '%s\n' "Python: $PYTHON"
 printf '%s\n' "Runtime: $TARGET_DIR"
+printf '%s\n' "Quota auth home: $QUOTA_AUTH_DIR"
 printf '%s\n' "Config: $CODEX_HOME/config.toml"
 printf '%s\n' "Restart Codex to reload config.toml and Hooks."

@@ -1,5 +1,8 @@
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import unittest
 from pathlib import Path
 
@@ -25,6 +28,7 @@ class HookConfigTest(unittest.TestCase):
             r"C:\Python\pythonw.exe",
             r"C:\Users\test\.codex_screen\codex_hook_relay.py",
             hook_profile="full",
+            platform_name="windows",
         )
 
         for event_name in HOOK_EVENTS:

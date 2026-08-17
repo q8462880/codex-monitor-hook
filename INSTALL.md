@@ -21,5 +21,23 @@ Codex home on macOS, pass `--codex-home "$CODEX_HOME"` so installation and Codex
 same `config.toml`. Add `--skip-hook-diagnostic` only to bypass the optional app-server
 diagnostic; the installer still verifies the hook block it writes.
 
-The default installer uses the `quota` hook profile, registering only `SessionStart` and
-`UserPromptSubmit`. Use `-HookProfile full` only to restore the legacy status signal path.
+The default installer uses the `quota` hook profile, registering `SessionStart`,
+`UserPromptSubmit`, and `SessionEnd`. On macOS, use `--hook-profile full` only to restore the legacy
+status signal path.
+
+## ChatGPT Quota Auth on macOS
+
+When the main Codex desktop client uses an API key or a third-party `openai_base_url`, it can
+rewrite `~/.codex/auth.json` back to API-key mode. The monitor therefore checks the isolated
+quota home first:
+
+```text
+~/.codex_screen/quota-codex-home/auth.json
+```
+
+Place a valid ChatGPT-format `auth.json` there with owner-only permissions. The monitor passes
+that directory as `CODEX_HOME` only to its private app-server process; it does not change the
+desktop client's normal login or copy credentials during installation. When an account-switching
+tool replaces the main `~/.codex/auth.json` with a valid ChatGPT login, the daemon securely
+syncs it to this private directory on the next quota refresh. API-key mode never overwrites the
+last valid private ChatGPT credential.

@@ -14,6 +14,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -30,6 +31,8 @@ CLIENT_NAME = "codex-monitor-hook"
 CLIENT_VERSION = "0.1.0"
 CODEX_EXE_ENV = "CODEX_SCREEN_CODEX_EXE"
 CODEX_HOME_ENV = "CODEX_HOME"
+QUOTA_CODEX_HOME_ENV = "CODEX_SCREEN_QUOTA_CODEX_HOME"
+DEFAULT_QUOTA_CODEX_HOME = Path.home() / ".codex_screen" / "quota-codex-home"
 RATE_LIMIT_METHOD = "account/rateLimits/read"
 INTERNAL_QUOTA_EVENT = "__codex_quota_update__"
 INTERNAL_QUOTA_REFRESH_EVENT = "__codex_quota_refresh__"
@@ -155,23 +158,54 @@ def _quota_query_enabled() -> bool:
 def _codex_auth_mode() -> Optional[str]:
     """只读取登录模式，不读取或记录 auth.json 中的密钥。"""
 
-    auth_path = _codex_home() / "auth.json"
+    return _auth_mode_for_path(_quota_codex_home() / "auth.json")
+
+
+def _auth_mode_for_path(auth_path: Path) -> Optional[str]:
+    """识别 auth.json 的登录类型，兼容缺少 auth_mode 的官方导出文件。"""
+
     try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
+        # Windows 导出的 auth.json 可能带 UTF-8 BOM；Codex 自身可读取，
+        # 这里也必须保持一致，否则只会误报为“没有登录模式”。
+        data = json.loads(auth_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
-    mode = data.get("auth_mode") if isinstance(data, dict) else None
-    return str(mode).strip().lower() if mode else None
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("auth_mode")
+    if mode:
+        return str(mode).strip().lower()
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict) and all(
+        isinstance(tokens.get(name), str) and tokens[name]
+        for name in ("access_token", "id_token", "refresh_token")
+    ):
+        return "chatgpt"
+    return None
 
 
 def _auth_file_signature() -> Optional[str]:
     """返回 auth.json 内容指纹；只用于检测账号切换，不记录原文。"""
 
-    path = _codex_home() / "auth.json"
+    path = _quota_codex_home() / "auth.json"
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def _has_complete_chatgpt_tokens(auth_path: Path) -> bool:
+    """只接受完整的 ChatGPT token 组，避免切号写入中途覆盖可用凭据。"""
+
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    return isinstance(tokens, dict) and all(
+        isinstance(tokens.get(name), str) and tokens[name]
+        for name in ("access_token", "id_token", "refresh_token")
+    )
 
 
 def _poll_quota_loop(
@@ -422,6 +456,59 @@ def _codex_home() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
+def _quota_codex_home() -> Path:
+    """按平台返回额度目录，避免改变 Windows 已验证的主目录行为。"""
+
+    configured = os.environ.get(QUOTA_CODEX_HOME_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    # Windows 的 app-server 已按主 CODEX_HOME 验证可用，不能让 macOS 为
+    # API Key/Desktop 定制的隔离逻辑改变其认证或 endpoint 解析行为。
+    if sys.platform != "darwin":
+        return _codex_home()
+    if _sync_main_chatgpt_auth():
+        return DEFAULT_QUOTA_CODEX_HOME
+    if (DEFAULT_QUOTA_CODEX_HOME / "auth.json").is_file():
+        return DEFAULT_QUOTA_CODEX_HOME
+    return _codex_home()
+
+
+def _sync_main_chatgpt_auth() -> bool:
+    """将主目录的 ChatGPT 登录原子同步到私有额度目录。
+
+    macOS 上许多账号切换工具只会覆盖 ~/.codex/auth.json。同步后额度 app-server
+    仍不会读取主目录的自定义 endpoint 配置；主文件改为 API Key 时也不会
+    覆盖最后一次有效 ChatGPT 登录，保证桌面端和额度查询可以共存。
+    """
+
+    source = _codex_home() / "auth.json"
+    target = DEFAULT_QUOTA_CODEX_HOME / "auth.json"
+    if (
+        _auth_mode_for_path(source) != "chatgpt"
+        or not _has_complete_chatgpt_tokens(source)
+    ):
+        return False
+    temporary: Optional[Path] = None
+    try:
+        contents = source.read_bytes()
+        if target.is_file() and target.read_bytes() == contents:
+            return True
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.chmod(0o700)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(contents)
+        temporary.chmod(0o600)
+        temporary.replace(target)
+        return True
+    except OSError:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
 def _looks_runnable(path: Path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > 0
@@ -525,7 +612,7 @@ class CodexQuotaSession:
             if not exe_path:
                 continue
             try:
-                process = _start_app_server(exe_path)
+                process = _start_app_server(exe_path, _quota_codex_home())
                 output: "queue.Queue[str]" = queue.Queue()
                 _start_reader(process.stdout, output)
                 _start_reader(process.stderr, None)
@@ -575,7 +662,7 @@ class CodexQuotaSession:
 
 
 def _query_rate_limits(exe_path: str, timeout_sec: float) -> Optional[Dict[str, Any]]:
-    proc = _start_app_server(exe_path)
+    proc = _start_app_server(exe_path, _quota_codex_home())
     output: "queue.Queue[str]" = queue.Queue()
     _start_reader(proc.stdout, output)
     _start_reader(proc.stderr, None)
@@ -588,11 +675,16 @@ def _query_rate_limits(exe_path: str, timeout_sec: float) -> Optional[Dict[str, 
         _stop_process(proc)
 
 
-def _start_app_server(exe_path: str) -> subprocess.Popen[str]:
+def _start_app_server(
+    exe_path: str, codex_home: Optional[Path] = None
+) -> subprocess.Popen[str]:
     # daemon 会复用这个 Codex app-server，直到 daemon 停止或连接失败。
     # Windows 下 codex.exe 属于控制台程序；如果父进程是 pythonw.exe，
     # 不设置 CREATE_NO_WINDOW 时，系统可能为它创建一个可见的 conhost 窗口。
     process_options = _hidden_process_options()
+    # 诊断需要读取主 config.toml，额度查询才传入隔离认证目录。将目录作为
+    # 显式参数可避免隔离 auth.json 存在时误让 hooks/list 读取空配置目录。
+    process_options["env"] = _app_server_environment(codex_home)
     return subprocess.Popen(
         [exe_path, "app-server", "--stdio"],
         stdin=subprocess.PIPE,
@@ -603,6 +695,14 @@ def _start_app_server(exe_path: str) -> subprocess.Popen[str]:
         errors="replace",
         **process_options,
     )
+
+
+def _app_server_environment(codex_home: Optional[Path] = None) -> Dict[str, str]:
+    """为 app-server 传入调用方指定的配置目录，默认保留主 Codex 配置。"""
+
+    environment = os.environ.copy()
+    environment[CODEX_HOME_ENV] = str(codex_home or _codex_home())
+    return environment
 
 
 def _hidden_process_options() -> Dict[str, Any]:

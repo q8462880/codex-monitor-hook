@@ -11,6 +11,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import codex_screen_daemon as daemon
+from codex_quota_client import INTERNAL_QUOTA_EVENT
 from codex_state_manager import CodexStateManager
 
 
@@ -145,6 +146,33 @@ class CodexScreenDaemonTest(unittest.TestCase):
         self.assertEqual(0, frame[3] & daemon.SCREEN_HID_CODEX_FLAG_CURRENT_VALID)
         self.assertEqual(0, frame[3] & daemon.SCREEN_HID_CODEX_FLAG_WEEKLY_VALID)
 
+    def test_missing_weekly_quota_stays_invalid_in_hid_frame(self):
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        with patch.object(daemon, "log_line"):
+            instance._apply_event(
+                {
+                    "_internal_kind": INTERNAL_QUOTA_EVENT,
+                    "quota_text": "codex 0% used",
+                    "current_used_percent": 0,
+                    "current_reset_sec": 3600,
+                    "weekly_used_percent": 0xFF,
+                    "weekly_reset_sec": 0xFFFFFFFF,
+                }
+            )
+
+        fields = instance._frame_business_fields(heartbeat=False)
+
+        self.assertEqual(0, fields["current_percent"])
+        self.assertEqual(3600, fields["current_reset"])
+        self.assertEqual(daemon.SCREEN_HID_CODEX_PERCENT_INVALID, fields["weekly_percent"])
+        self.assertEqual(daemon.SCREEN_HID_CODEX_RESET_INVALID, fields["weekly_reset"])
+        self.assertEqual(
+            daemon.SCREEN_HID_CODEX_FLAG_STATUS_VALID
+            | daemon.SCREEN_HID_CODEX_FLAG_CURRENT_VALID
+            | daemon.SCREEN_HID_CODEX_FLAG_CURRENT_RESET_VALID,
+            fields["flags"],
+        )
+
     def test_state_queue_drops_oldest_event_when_full(self):
         state_queue = daemon.BoundedStateQueue(maxsize=1)
         state_queue.put({"hook_event_name": "PreToolUse"})
@@ -226,6 +254,23 @@ class CodexScreenDaemonTest(unittest.TestCase):
         selected = instance._pick_device(devices)
 
         self.assertIs(devices[1], selected)
+
+    def test_codex_daemon_selects_macos_monitor_collection(self):
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        devices = [
+            {"usage_page": 0x0001, "usage": 0x0006, "interface_number": 0},
+            {"usage_page": 0xFF00, "usage": 0x0061, "interface_number": 1},
+        ]
+
+        selected = instance._pick_device(devices)
+
+        self.assertIs(devices[1], selected)
+
+    def test_codex_daemon_does_not_fallback_to_unknown_hid_collection(self):
+        instance = daemon.CodexScreenDaemon(frame_seq=1)
+        devices = [{"usage_page": 0x0001, "usage": 0x0006}]
+
+        self.assertIsNone(instance._pick_device(devices))
 
     def test_hid_open_logs_when_device_is_not_enumerated(self):
         class EmptyHid:

@@ -10,6 +10,7 @@ Codex Hook JSON 时立即返回；只有命令行同时包含 Hook JSON 和本�
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import sys
 from pathlib import Path
@@ -33,7 +34,9 @@ def _hook_invocation(argv: list[str]) -> Optional[Tuple[str, str]]:
             event = None
         if isinstance(event, dict) and event.get("hook_event_name"):
             event_json = text
-        if Path(text).name.lower() == RELAY_SCRIPT_NAME:
+        # 该模块在 Windows 的 Python 初始化阶段运行，但测试/诊断工具
+        # 可能在 macOS 上传入 Windows 风格路径；ntpath 两端都能正确解析。
+        if ntpath.basename(text).lower() == RELAY_SCRIPT_NAME:
             relay_path = text
     return (event_json, relay_path) if event_json and relay_path else None
 
